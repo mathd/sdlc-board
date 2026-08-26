@@ -56,6 +56,10 @@
                       border:1px solid var(--line); border-radius:4px; padding:1px 5px; }
   .column > h2 .wip.over { color:#9c7a15; border-color:#E3B23A; background:#E3B23A18; }
   .column.blocked { flex-basis:280px; border-color:#dc696655; }
+  .vaultpick { background:var(--card); color:var(--ink); border:1px solid var(--line);
+               border-radius:8px; padding:5px 9px; font:inherit; font-size:12px; font-weight:600;
+               margin-left:12px; cursor:pointer; }
+  .vaultpick:hover { border-color:var(--brand); }
   /* focus mode: Backlog/Done collapse to slim strips (click to expand back) */
   .column.min { flex:0 0 34px; cursor:pointer; align-items:center; justify-content:flex-start;
                 padding-top:12px; }
@@ -284,9 +288,11 @@
 <body>
 <header>
   <div class="wordmark">
-    <span class="logo">Ticketing</span>
+    <span class="logo" id="wordmark">Ticketing</span>
     <h1>SDLC board</h1>
   </div>
+  <select id="vaultpick" class="vaultpick" onchange="switchVault(this.value)"
+          title="project vault — one WebSocket serves them all, so switching needs no reconnect"></select>
   <span class="meta" id="stamp"><span class="dot"></span>live</span>
   <div class="legend">
     <span class="badge b-agent">agent:*</span>
@@ -614,7 +620,7 @@ function drop(e, status, el){
 }
 async function save(ticket, msg){
   try {
-    const r = await fetch("/ticket", { method:"POST", headers:{"Content-Type":"application/json"},
+    const r = await fetch(`/ticket${vq("?")}`, { method:"POST", headers:{"Content-Type":"application/json"},
                                        body: JSON.stringify(ticket) });  // _rev = status moved from
     if (r.status === 409){
       const c = await r.json().catch(() => ({}));
@@ -652,11 +658,42 @@ function toast(msg){
 
 /* --- detail modal (tabs: thread | history) --- */
 let modalTab = "thread";
+/* --- vault switcher ---------------------------------------------------------
+   One WebSocket connection on the server serves every vault, so switching is a
+   filter over data already arriving: no reconnect, just a different ?vault=. */
+let VAULT = "";
+try { VAULT = localStorage.getItem("sdlc.vault") || ""; } catch { VAULT = ""; }
+const vq = (sep) => VAULT ? `${sep}vault=${encodeURIComponent(VAULT)}` : "";
+function switchVault(v){
+  VAULT = v;
+  try { localStorage.setItem("sdlc.vault", v); } catch {}
+  Object.keys(HIST).forEach(k => delete HIST[k]);   // history is per vault
+  painted = "";                                      // force a full repaint
+  render();
+}
+function paintVaults(b){
+  const sel = document.getElementById("vaultpick");
+  const list = b.vaults || [];
+  if (!sel) return;
+  sel.style.display = list.length > 1 ? "" : "none";
+  const sig = list.join("|") + "::" + (b.vault || "");
+  if (sel.dataset.sig !== sig){
+    sel.dataset.sig = sig;
+    sel.innerHTML = list.map(v => `<option value="${esc(v)}">${esc(v)}</option>`).join("");
+  }
+  if (b.vault) sel.value = b.vault;
+  if (b.project) {
+    document.title = `${b.project} — board`;
+    const wm = document.getElementById("wordmark");
+    if (wm) wm.textContent = b.project.split(/\s+/)[0];
+  }
+}
+
 const HIST = {};  // key -> events from /history (fetched on open, not per repaint)
 
 async function loadHistory(key){
   try {
-    const r = await (await fetch(`/history?key=${key}`)).json();
+    const r = await (await fetch(`/history?key=${key}${vq("&")}`)).json();
     HIST[key] = r.events || [];
   } catch { HIST[key] = []; }
   if (selectedKey === key) renderModal();
@@ -856,7 +893,7 @@ async function openMetrics(){
   const m = document.getElementById("mmodal");
   m.innerHTML = `<div class="mbody"><p class="empty">Computing from git history…</p></div>`;
   try {
-    const d = await (await fetch("/metrics")).json();
+    const d = await (await fetch(`/metrics${vq("?")}`)).json();
     const cols = [...BOARD.statuses.filter(s => s !== "Done"), "BLOCKED"];
     const rows = d.tickets.map(t => `<tr onclick="closeMetrics();openTicket('${t.key}')">
         <td><b>${esc(t.key)}</b></td>
@@ -891,7 +928,16 @@ async function render(){
   if (dragKey) return;                        // don't wipe drag state mid-drag
   if (document.activeElement && document.activeElement.classList.contains("archdate")) return;  // date picker open
   try {
-    const fetched = await (await fetch("/board?t="+Date.now())).json();
+    const fetched = await (await fetch("/board?t="+Date.now()+vq("&"))).json();
+    paintVaults(fetched);
+    if (fetched.unsupportedSchema){
+      const u = fetched.unsupportedSchema;
+      document.getElementById("board").innerHTML =
+        `<p style="padding:20px;color:#F68A4B">This vault's board config is schema ${u.found}, and this
+         board understands up to ${u.supported}.<br>Update the board — it will not guess at a config
+         it does not understand.</p>`;
+      return;
+    }
     const same = painted === sig(fetched);   // most polls change nothing
     BOARD = fetched;
     if (!same) {

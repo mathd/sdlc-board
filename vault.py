@@ -299,13 +299,13 @@ def _request(method: str, path: str, payload=None, query: str = ""):
         return json.loads(r.read())
 
 
-def put_note(path: str, content: str) -> dict:
+def put_note(path: str, content: str, vault: str | None = None) -> dict:
     now_ms = int(time.time() * 1000)
     return _request(
         "POST",
         "/api/note",
         {
-            "vault": VAULT,
+            "vault": vault or VAULT,
             "path": path,
             "content": content,
             "contentHash": encode_hash32(content),
@@ -315,8 +315,8 @@ def put_note(path: str, content: str) -> dict:
     )
 
 
-def get_note(path: str) -> dict:
-    q = f"?vault={VAULT}&path={urllib.parse.quote(path)}"
+def get_note(path: str, vault: str | None = None) -> dict:
+    q = f"?vault={vault or VAULT}&path={urllib.parse.quote(path)}"
     return _request("GET", "/api/note", query=q)
 
 

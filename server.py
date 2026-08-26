@@ -38,6 +38,7 @@ from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+import boardconfig
 import translog
 from fnsclient import FNSReadClient, VaultMirror
 from vault import get_note as vault_get_note
@@ -50,7 +51,7 @@ KEY_RE = re.compile(r"^[A-Z][A-Z0-9]*-\d+$")
 
 API = os.environ.get("FNS_API", "http://10.99.0.31:9000")
 TOKEN = os.environ.get("FNS_TOKEN", "")
-VAULT = os.environ.get("FNS_VAULT", "sdlc")
+VAULT = os.environ.get("FNS_VAULT", "sdlc")  # the default/selected vault
 CLIENT = os.environ.get("FNS_CLIENT", "sdlcBoard")
 MIRROR_DIR = Path(os.environ.get("SDLC_MIRROR", Path.home() / ".cache" / "sdlc-board"))
 
@@ -61,7 +62,27 @@ import vault as _vault
 
 _vault.API, _vault.TOKEN, _vault.VAULT, _vault.CLIENT = API.rstrip("/"), TOKEN, VAULT, CLIENT
 
-MIRROR = VaultMirror(MIRROR_DIR, [VAULT])
+def discover_vaults():
+    """Every vault this token may reach, from GET /api/vault.
+
+    The switcher is populated from this. One WebSocket connection serves every
+    vault (broadcasts are per user, tagged with the vault), so switching is a
+    filter over messages already arriving -- no reconnect.
+    """
+    try:
+        r = _vault._request("GET", "/api/vault")
+    except Exception as e:  # noqa: BLE001 - offline start
+        print(f"[board] cannot list vaults ({e}); using {VAULT} only", file=sys.stderr)
+        return [VAULT]
+    rows = r.get("data") or []
+    names = [row.get("vault") for row in rows if row.get("vault")]
+    if VAULT not in names:
+        names.append(VAULT)
+    return names or [VAULT]
+
+
+VAULTS = discover_vaults() if TOKEN else [VAULT]
+MIRROR = VaultMirror(MIRROR_DIR, VAULTS)
 CLIENT_THREAD = None
 
 
@@ -70,23 +91,35 @@ def sort_key(t):
     return (prefix, int(num))
 
 
-def _log_text():
+def _log_text(vault=None):
     """The transition log, served from the MIRROR -- no vault round trip.
 
     The log is a note like any other, so the WebSocket mirror already holds a
     current copy and it stays readable when the vault is unreachable.
     """
-    return MIRROR.snapshot(VAULT).get(translog.LOG_PATH, "")
+    return MIRROR.snapshot(vault or VAULT).get(translog.LOG_PATH, "")
 
 
-def tickets_from_mirror(vault=VAULT):
+def board_config(vault=None):
+    """This vault's `_board/config.md`, from the mirror."""
+    text = MIRROR.snapshot(vault or VAULT).get(boardconfig.CONFIG_PATH, "")
+    return boardconfig.parse(text)
+
+
+def _selected_vault(query):
+    """The vault named by ?vault=, restricted to what the token may reach."""
+    want = parse_qs(query).get("vault", [""])[0]
+    return want if want in VAULTS else VAULT
+
+
+def tickets_from_mirror(vault=None):
     """Parse every ticket note in the mirror into a ticket dict.
 
     Notes that fail to parse are skipped rather than taking the board down: a
     hand-edit in Obsidian should not blank the board.
     """
     out = []
-    for path, content in MIRROR.snapshot(vault).items():
+    for path, content in MIRROR.snapshot(vault or VAULT).items():
         if not path.startswith(TICKET_PREFIX):
             continue
         try:
@@ -120,18 +153,18 @@ class VaultWriteError(Exception):
 BOARD_WRITABLE_FIELDS = ("status", "labels", "assignee", "pr", "classification",
                          "parent", "type")
 
-def _log_read(path):
+def _log_read(path, vault=None):
     """Read a note for the transition log, or None if it does not exist yet."""
     try:
-        envelope = vault_get_note(path)
+        envelope = vault_get_note(path, vault)
     except Exception:  # noqa: BLE001 - absent note, or vault unreachable
         return None
     data = envelope.get("data")
     return data.get("content") if data else None
 
 
-def _log_write(path, content):
-    r = vault_put_note(path, content)
+def _log_write(path, content, vault=None):
+    r = vault_put_note(path, content, vault)
     if r.get("code") != 1:
         raise VaultWriteError(f"{r.get('code')} {r.get('message')}")
 
@@ -146,7 +179,7 @@ MAX_CAS_ATTEMPTS = 3  # bound the retry so a hot note cannot spin
 WRITE_LOCK = threading.Lock()
 
 
-def write_ticket(key, ticket, moving_from, actor):
+def write_ticket(key, ticket, moving_from, actor, vault=None):
     """Read, verify the status field, write. Returns {status, attempts}.
 
     On a lost race the vault's status has already moved, so the write is
@@ -164,7 +197,7 @@ def write_ticket(key, ticket, moving_from, actor):
     with WRITE_LOCK:
         for attempt in range(1, MAX_CAS_ATTEMPTS + 1):
             try:
-                envelope = vault_get_note(path)
+                envelope = vault_get_note(path, vault)
             except Exception as e:  # noqa: BLE001 - surfaced to the browser
                 raise VaultWriteError(f"cannot read {path}: {e}") from e
             current = envelope.get("data")
@@ -212,7 +245,7 @@ def write_ticket(key, ticket, moving_from, actor):
                 return {"status": new_status, "attempts": attempt, "noop": True}
 
             try:
-                r = vault_put_note(path, new_content)
+                r = vault_put_note(path, new_content, vault)
             except Exception as e:  # noqa: BLE001
                 raise VaultWriteError(str(e)) from e
             if r.get("code") == 1:
@@ -244,12 +277,43 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         url = urlparse(self.path)
 
+        if url.path == "/vaults":
+            self._json(200, {"vaults": VAULTS, "selected": VAULT})
+            return
+
         if url.path == "/board":
+            vault = _selected_vault(url.query)
             board = json.loads(CONFIG.read_text(encoding="utf-8"))
-            tickets = tickets_from_mirror()
+            try:
+                cfg = board_config(vault)
+            except boardconfig.UnsupportedSchema as e:
+                # Refuse to render rather than guess at a config we do not
+                # understand (plan §4).
+                self._json(
+                    200,
+                    {
+                        "vault": vault,
+                        "vaults": VAULTS,
+                        "tickets": [],
+                        "now": int(time.time()),
+                        "unsupportedSchema": {"found": e.found, "supported": e.supported},
+                        "readOnly": True,
+                        "readOnlyReason": str(e),
+                    },
+                )
+                return
+            board["statuses"] = cfg["statuses"]
+            board["blocked"] = (cfg["transversal"] or ["BLOCKED"])[0]
+            board["transversal"] = cfg["transversal"]
+            board["wip"] = cfg["wip"]
+            if cfg.get("project"):
+                board["project"] = cfg["project"]
+            board["vault"] = vault
+            board["vaults"] = VAULTS
+            tickets = tickets_from_mirror(vault)
             # _since drives the age chip on each card: when the ticket last
             # changed status, from the transition log.
-            events = translog.read_events(_log_text())
+            events = translog.read_events(_log_text(vault))
             for t in tickets:
                 ev = events.get(t["key"])
                 if ev:
@@ -274,13 +338,18 @@ class Handler(SimpleHTTPRequestHandler):
             if not KEY_RE.match(key):
                 self.send_error(400, "bad key")
                 return
-            self._json(200, {"key": key, "events": translog.history(_log_text(), key)})
+            vault = _selected_vault(url.query)
+            self._json(
+                200,
+                {"key": key, "events": translog.history(_log_text(vault), key)},
+            )
             return
 
         if url.path == "/metrics":
+            vault = _selected_vault(url.query)
             now = int(time.time())
-            statuses = {t["key"]: t.get("status") for t in tickets_from_mirror()}
-            rows = translog.all_analysis(_log_text(), now, statuses)
+            statuses = {t["key"]: t.get("status") for t in tickets_from_mirror(vault)}
+            rows = translog.all_analysis(_log_text(vault), now, statuses)
             self._json(
                 200,
                 {"now": now, "tickets": sorted(rows.values(), key=sort_key)},
@@ -361,8 +430,9 @@ class Handler(SimpleHTTPRequestHandler):
             "effort": ticket.pop("effort", None) or "",
         }
 
+        vault = _selected_vault(urlparse(self.path).query)
         try:
-            result = write_ticket(key, ticket, moving_from, actor)
+            result = write_ticket(key, ticket, moving_from, actor, vault)
         except ConflictError as e:
             self._json(
                 409,
@@ -392,7 +462,12 @@ class Handler(SimpleHTTPRequestHandler):
         if moved_from is not None and moved_from != result["status"]:
             try:
                 translog.append_transition(
-                    _log_read, _log_write, key, moved_from, result["status"], actor
+                    lambda p: _log_read(p, vault),
+                    lambda p, c: _log_write(p, c, vault),
+                    key,
+                    moved_from,
+                    result["status"],
+                    actor,
                 )
             except Exception as e:  # noqa: BLE001 - never fail the write on this
                 print(
@@ -418,11 +493,11 @@ def main():
             file=sys.stderr,
         )
     else:
-        CLIENT_THREAD = FNSReadClient(API, TOKEN, [VAULT], MIRROR, client_type=CLIENT)
+        CLIENT_THREAD = FNSReadClient(API, TOKEN, VAULTS, MIRROR, client_type=CLIENT)
         CLIENT_THREAD.start()
 
     print(f"sdlc board on http://localhost:{port}/board.html")
-    print(f"vault: {VAULT} at {API}")
+    print(f"vaults: {', '.join(VAULTS)} at {API} (selected: {VAULT})")
     print(f"mirror: {MIRROR_DIR} ({len(MIRROR.snapshot(VAULT))} notes on disk)")
     try:
         ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()

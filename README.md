@@ -244,6 +244,29 @@ zero after. The mirror persists the server's `mtime`/`ctime` per note alongside 
     line) changes the output.
   - The log is read from the **mirror**, not the vault, so `/metrics` costs no round trip and
     survives the vault being unreachable.
+- **Phase 5 partially complete — the switcher is built, the two-vault criterion is NOT verified.**
+  - Columns, project name, transversal statuses and WIP limits now render from the selected
+    vault's `_board/config.md`, not from `config.json`. Proven by mutation: rewriting the vault
+    config to `["Icebox", "Doing", "Shipped"]` changed the rendered columns, and a `schema: 99`
+    config makes the board **refuse to render** and serve zero tickets rather than guess.
+  - `schema` gating follows ADR-017's rule that the poison line has a bottom end: `schema <= 0`,
+    a string, or a boolean is a broken envelope and renders as the current schema; only a
+    genuinely higher number refuses.
+  - `/vaults`, `/board`, `/history`, `/metrics` and `POST /ticket` are all vault-scoped via
+    `?vault=`; an unknown vault falls back to the default rather than erroring. One WebSocket
+    connection mirrors every vault, so switching is a filter over data already arriving.
+  - The switcher hides itself when only one vault exists. Browser-verified: with a stubbed
+    two-vault payload it shows both options, follows the selection, retitles the page per project
+    and persists the choice to `localStorage`; a real browser write through the vault-scoped path
+    reached the vault and was recorded in the transition log.
+  - **NOT verified, and this is the phase's own "Done when":** *two vaults with deliberately
+    different status lists both render correctly*, and *switching between them needs no reconnect*.
+    The token's allowlist covers only `sdlc` (`Vault access restricted: sdlc-test2`), so the test
+    cannot be run and the multi-vault path has never executed against a second real vault. The UI
+    mechanism was exercised with a stub, which is not the same claim. **Widen the token allowlist
+    and run it before relying on Phase 5.**
+  - The `sdlc-ticket` skill is deliberately **not** repointed yet: its `references/local-tracker.md`
+    documents the git board, which §8 requires to keep working until cutover. Repoint it there.
 - **Not verified:** the two-vault case (§10 "each vault catches up after a reconnect"). Watermarks
   are per vault and reload independently, but the token's allowlist covers only `sdlc`, so the
   convergence test itself has not been run. Do it before relying on Phase 5.
