@@ -205,6 +205,24 @@ zero after. The mirror persists the server's `mtime`/`ctime` per note alongside 
     urllib.request` binds it — verified by reaching the network layer), and the cross-process race
     on the CAS, which is the accepted residual of the server-side approach FNS forces (see
     `baseHash` above), not a defect.
+- **Second review pass (fixes' interaction).** Three findings, all validated by execution:
+  - **Two correct fixes composed into a new defect.** Path validation (fix 5) and the reordered
+    rename (fix 6) are each right alone: `apply_rename` mutated the in-memory mirror *before*
+    `_persist_note` validated the destination, so a rejected path made the note vanish from memory
+    — and since `_load` only re-reads at construction, a retry then deleted the surviving file from
+    disk. Executed both steps. Both paths are now validated before anything is touched, and the
+    per-note `mtime` metadata moves with the rename (it was being orphaned, which would have
+    re-created the `NeedPush` storm for renamed notes).
+  - **Sync completion was inferred from silence.** The first fix treated a 3s socket timeout as
+    proof the last page had fully arrived. It is not. The page metadata carries `totalCount` and
+    arrives *before* its details (`ws_sync_download_cache.go:228-239`), so the client now **counts**
+    them. Deterministic, and it also cut a complete sync from ~3s to ~1s. Verified: interrupting at
+    4 different points (up to 194/272 notes) holds the watermark; mutation-checked by removing the
+    completion gate, which advances it and skips 225 notes permanently.
+  - **The description escaping was not injective.** Escaping only the marker maps two distinct
+    inputs onto one rendering, so a description already containing `<!-- \/description -->` came
+    back altered. Now escapes the escape character first and unescapes in mirror-image order;
+    14 adversarial cases (nested, repeated, sentinel-only) round-trip exactly.
 - **Not verified:** the two-vault case (§10 "each vault catches up after a reconnect"). Watermarks
   are per vault and reload independently, but the token's allowlist covers only `sdlc`, so the
   convergence test itself has not been run. Do it before relying on Phase 5.

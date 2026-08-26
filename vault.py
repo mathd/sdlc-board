@@ -50,7 +50,26 @@ DESC_SEPARATOR = "\n" + DESC_MARKER
 # A description may legitimately CONTAIN the marker -- a ticket about this very
 # migration would. Escape it on the way out and restore it on the way in, so the
 # boundary stays unambiguous without truncating real content.
+#
+# The escape must be INJECTIVE: escaping only the marker maps two distinct
+# inputs (the raw marker, and text that already contains the escaped spelling)
+# onto the same rendering, so the already-escaped one comes back altered. So
+# escape the escape character first, and unescape in the mirror-image order.
 DESC_MARKER_ESCAPED = "<!-- \\/description -->"
+_ESC_SENTINEL = "<!-- \\\\"
+_RAW_SENTINEL = "<!-- \\"
+
+
+def _escape_desc(text: str) -> str:
+    return text.replace(_RAW_SENTINEL, _ESC_SENTINEL).replace(
+        DESC_MARKER, DESC_MARKER_ESCAPED
+    )
+
+
+def _unescape_desc(text: str) -> str:
+    return text.replace(DESC_MARKER_ESCAPED, DESC_MARKER).replace(
+        _ESC_SENTINEL, _RAW_SENTINEL
+    )
 
 
 # ---------------------------------------------------------------- hashing
@@ -159,7 +178,7 @@ def note_from_ticket(t: dict) -> str:
         # separator. Because the separator is a constant, the parser can remove
         # exactly it and recover a description whether or not it ends in a
         # newline of its own -- descriptions in the corpus do both.
-        lines.append(desc.replace(DESC_MARKER, DESC_MARKER_ESCAPED) + DESC_SEPARATOR)
+        lines.append(_escape_desc(desc) + DESC_SEPARATOR)
 
     # Everything the frontmatter cannot hold, verbatim and recoverable.
     # `pr` rides along whenever it is not a bare URL string, so the object's
@@ -260,7 +279,7 @@ def _split_prose(prose: str, key: str):
     else:
         description = text.strip("\n") or None
     if description:
-        description = description.replace(DESC_MARKER_ESCAPED, DESC_MARKER)
+        description = _unescape_desc(description)
     return summary, (description or None)
 
 

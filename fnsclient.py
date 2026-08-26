@@ -283,13 +283,25 @@ class VaultMirror:
 
     def apply_rename(self, vault: str, old: str, new: str) -> None:
         with self.lock:
+            # Validate BOTH paths before touching anything. Mutating first and
+            # validating inside _persist_note loses the note entirely when the
+            # destination is rejected: the source is already gone from memory,
+            # _load only re-reads at construction, and a retry then deletes the
+            # surviving file from disk too.
+            self._safe_target(vault, old)
+            self._safe_target(vault, new)
+
             notes = self.notes.setdefault(vault, {})
             content = notes.pop(old, None)
+            meta = self.meta.setdefault(vault, {})
+            note_meta = meta.pop(old, None)
             # Write the destination BEFORE removing the source, so a crash
             # between the two leaves a duplicate (self-healing on next sync)
             # rather than nothing at all.
             if content is not None:
                 notes[new] = content
+                if note_meta is not None:
+                    meta[new] = note_meta
                 self._persist_note(vault, new, content)
             self._remove_note(vault, old)
 
@@ -441,6 +453,10 @@ class FNSReadClient(threading.Thread):
             },
         )
         pending_watermark = None
+        completed = False
+        draining_last = False
+        last_page_expected = 0
+        last_page_seen = 0
         while not self.stop_flag.is_set():
             action, env = self._expect()
             data = env.get("data") or {}
@@ -453,6 +469,7 @@ class FNSReadClient(threading.Thread):
                     )
                 pending_watermark = data.get("lastTime") or pending_watermark
                 if not (data.get("needModifyCount") or data.get("needDeleteCount")):
+                    completed = True  # nothing to pull: the sync IS complete
                     break
                 # Pages are queued but unsent; -1 starts the pull.
                 self._send(
@@ -462,8 +479,19 @@ class FNSReadClient(threading.Thread):
                 continue
 
             if action == "NoteSyncPage":
+                # The page metadata carries TotalCount -- how many detail
+                # messages follow -- and arrives BEFORE them
+                # (ws_sync_download_cache.go:228-239). Counting them is
+                # deterministic; waiting for silence is not.
+                expected = int(data.get("totalCount") or 0)
                 if data.get("isLast"):
-                    break  # last page's details follow, then we are done
+                    last_page_expected = expected
+                    last_page_seen = 0
+                    draining_last = True
+                    if expected == 0:
+                        completed = True
+                        break
+                    continue
                 self._send(
                     "NoteSyncPageAck",
                     {
@@ -475,36 +503,18 @@ class FNSReadClient(threading.Thread):
                 continue
 
             self._dispatch(action, env, default_vault=vault)
+            if draining_last:
+                last_page_seen += 1
+                if last_page_seen >= last_page_expected:
+                    completed = True
+                    break
 
-        # Drain the final page's detail messages, which arrive after the
-        # isLast metadata frame.
-        deadline = time.time() + 20
-        drained_cleanly = True
-        while not self.stop_flag.is_set() and time.time() < deadline:
-            try:
-                action, env = self._expect(timeout=3.0)
-            except OSError as e:
-                # A socket TIMEOUT is how a clean drain ends: the last page's
-                # details have all arrived and nothing more is coming. Any
-                # other socket error means the connection broke mid-drain.
-                drained_cleanly = isinstance(e, socket.timeout)
-                break
-            except WSError:
-                drained_cleanly = False
-                break
-            if action in ("NoteSyncPage", "NoteSyncEnd"):
-                continue
-            self._dispatch(action, env, default_vault=vault)
-        else:
-            # Ran out of wall clock with messages still arriving.
-            drained_cleanly = False
-
-        # ONLY advance the watermark on a complete sync. NoteSync returns
-        # changes strictly after lastTime, so advancing it past notes that were
-        # never applied skips them PERMANENTLY -- the mirror goes silently and
-        # unrecoverably stale. Leaving it behind costs a re-sync of notes we
-        # already hold, which is cheap and self-correcting.
-        if pending_watermark and drained_cleanly:
+        # ONLY advance the watermark on a sync we know finished. NoteSync
+        # returns changes strictly after lastTime, so advancing it past notes
+        # that were never applied skips them PERMANENTLY -- the mirror goes
+        # silently and unrecoverably stale. Leaving it behind costs a re-sync of
+        # notes we already hold, which is cheap and self-correcting.
+        if pending_watermark and completed:
             self.mirror.set_watermark(vault, int(pending_watermark))
         elif pending_watermark:
             print(
