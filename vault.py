@@ -315,6 +315,24 @@ def put_note(path: str, content: str, vault: str | None = None) -> dict:
     )
 
 
+def move_note(old_path: str, new_path: str, vault: str | None = None) -> dict:
+    """Move a note within a vault.
+
+    The route is `POST /api/note/rename` and it takes `oldPath` (source) and
+    `path` (destination) -- NOT the `path`/`destination` pair of
+    `NoteMoveRequest`, which is a DTO with no route bound to it. Getting this
+    wrong returns `305 Invalid Params`.
+
+    Verified to be a true move: the source leaves the note listing, the
+    destination appears, and the total count is unchanged.
+    """
+    return _request(
+        "POST",
+        "/api/note/rename",
+        {"vault": vault or VAULT, "oldPath": old_path, "path": new_path},
+    )
+
+
 def get_note(path: str, vault: str | None = None) -> dict:
     q = f"?vault={vault or VAULT}&path={urllib.parse.quote(path)}"
     return _request("GET", "/api/note", query=q)

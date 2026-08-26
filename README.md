@@ -267,6 +267,32 @@ zero after. The mirror persists the server's `mtime`/`ctime` per note alongside 
     and run it before relying on Phase 5.**
   - The `sdlc-ticket` skill is deliberately **not** repointed yet: its `references/local-tracker.md`
     documents the git board, which §8 requires to keep working until cutover. Repoint it there.
+- **Phase 6: archive done; GitSync backup is FNS's job, not this repo's.**
+  - `POST /archive` moves Done tickets to `archive/` in the vault. Archived notes leave the board
+    automatically, because a note is a ticket only if it lives under `tickets/`.
+  - **The route is `POST /api/note/rename`, not `/api/note/move`.** The plan names the latter;
+    there is no such route. It takes `oldPath` (source) and `path` (destination) — *not* the
+    `path`/`destination` pair of `NoteMoveRequest`, which is a DTO with no route bound to it.
+    Sending the plan's shape returns `305 Invalid Params`. Verified to be a true move: the source
+    leaves the listing, the destination appears, the total count is unchanged.
+  - **A dated archive fails closed.** `?before=` now reads Done dates from the transition log
+    rather than git. A ticket with no logged transition has no known Done date, so it is **skipped
+    and reported** (`skippedNoLoggedDate`) rather than archived on a guess. Verified: with an empty
+    log, `?before=2026-08-01` archived 0 and skipped all 214. With a log seeded so one ticket
+    closed before the cutoff and one after, exactly the first was archived.
+  - **GitSync is not implemented here, deliberately.** It is a Fast Note Sync server feature,
+    configured in its own WebGUI/config — the plan says "configure", not "build", and a board that
+    reimplemented it would be duplicating the vault's own backup. What the source confirms, so the
+    configuration is made with open eyes:
+    - `Delay` is a **debounce, not an interval**: `NotifyUpdated` re-arms the timer on every
+      change, so continuous activity postpones the commit indefinitely.
+    - Every commit carries a fixed identity and the hardcoded message
+      `"Update from Sync Service"` (`git_sync_service.go:801`), so the git history says nothing
+      about who changed what. It is a **backup, not an audit trail and not a timing source** —
+      which is exactly why Phase 4's transition log exists.
+    - `retentionDays` prunes `GitSyncHistory` rows — the sync job's own status log in the database
+      (`git_sync_service.go:651-670`) — and never touches notes. `-1` keeps only the latest record,
+      `0` disables cleanup, positive is a day count.
 - **Not verified:** the two-vault case (§10 "each vault catches up after a reconnect"). Watermarks
   are per vault and reload independently, but the token's allowlist covers only `sdlc`, so the
   convergence test itself has not been run. Do it before relying on Phase 5.

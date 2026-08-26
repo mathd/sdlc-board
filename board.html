@@ -529,7 +529,7 @@ function column(name, tickets, blocked){
     <h2>${esc(name)} ${wipTag(name, list)}${name === "Done" && list.length
       ? ` <input type="date" class="archdate" value="${archBefore}" onchange="archBefore=this.value"
             title="cutoff: archive tickets closed before this date (empty = all)">
-          <button class="mbtn" onclick="archiveDone(event)" title="move Done tickets to .sdlc/tickets/archive/ on the state branch">🗂</button>` : ""}
+          <button class="mbtn" onclick="archiveDone(event)" title="move Done tickets to archive/ in the vault">🗂</button>` : ""}
       <span class="cnt">${list.length}</span></h2>
     <div class="cards" data-cards="${s}">${cards}</div>
   </div>`;
@@ -644,9 +644,12 @@ async function archiveDone(e){
   e.stopPropagation();
   try {
     const q = archBefore ? `?before=${archBefore}` : "";
-    const d = await (await fetch("/archive" + q, { method:"POST" })).json();
-    toast(d.archived.length ? `🗂 archived ${d.archived.join(", ")}`
-                            : archBefore ? `nothing closed before ${archBefore}` : "nothing to archive");
+    const d = await (await fetch("/archive" + q + (q ? vq("&") : vq("?")), { method:"POST" })).json();
+    const extra = (d.failed && d.failed.length) ? ` · ${d.failed.length} failed` : "";
+    const skip = (d.skippedNoLoggedDate && d.skippedNoLoggedDate.length)
+      ? ` · ${d.skippedNoLoggedDate.length} skipped (no logged Done date)` : "";
+    toast(d.archived.length ? `🗂 archived ${d.archived.length} ticket(s)${extra}${skip}`
+                            : archBefore ? `nothing closed before ${archBefore}${skip}` : `nothing to archive${skip}`);
     render();
   } catch(err){ toast("archive failed: " + err.message); }
 }

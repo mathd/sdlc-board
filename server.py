@@ -43,6 +43,7 @@ import translog
 from fnsclient import FNSReadClient, VaultMirror
 from vault import get_note as vault_get_note
 from vault import note_from_ticket, ticket_from_note
+from vault import move_note as vault_move_note
 from vault import put_note as vault_put_note
 
 DIR = Path(__file__).resolve().parent
@@ -367,12 +368,66 @@ class Handler(SimpleHTTPRequestHandler):
             self._write_ticket()
             return
         if route == "/archive":
-            self.send_error(
-                503,
-                "archive moves to POST /api/note/move in Phase 6",
-            )
+            self._archive(urlparse(self.path).query)
             return
         self.send_error(404)
+
+    def _archive(self, query=""):
+        """Move Done tickets into `archive/`.
+
+        `?before=YYYY-MM-DD` archives only tickets that entered Done before that
+        day; no parameter archives every Done ticket. The cutoff comes from the
+        transition log, which is the only timing source now -- a ticket with no
+        logged transition has no known Done date, so a dated archive skips it
+        rather than guessing.
+        """
+        params = parse_qs(query)
+        vault = _selected_vault(query)
+        before = params.get("before", [""])[0]
+        cutoff = None
+        if before:
+            try:
+                cutoff = time.mktime(time.strptime(before, "%Y-%m-%d"))
+            except ValueError:
+                self.send_error(400, "bad before date (want YYYY-MM-DD)")
+                return
+
+        events = translog.read_events(_log_text(vault))
+        moved, failed, skipped = [], [], []
+        for t in tickets_from_mirror(vault):
+            if t.get("status") != "Done":
+                continue
+            key = t["key"]
+            if cutoff is not None:
+                ev = events.get(key)
+                if not ev:
+                    skipped.append(key)  # no logged Done date: do not guess
+                    continue
+                if ev[-1]["ts"] >= cutoff:
+                    continue
+            src = f"{TICKET_PREFIX}{key}.md"
+            try:
+                r = vault_move_note(src, f"archive/{key}.md", vault)
+            except Exception as e:  # noqa: BLE001
+                failed.append({"key": key, "error": str(e)[:120]})
+                continue
+            if r.get("code") == 1:
+                moved.append(key)
+            else:
+                failed.append({"key": key, "error": f"{r.get('code')} {r.get('message')}"})
+
+        self._json(
+            200,
+            {
+                "ok": not failed,
+                "vault": vault,
+                "archived": sorted(moved, key=lambda k: sort_key({"key": k})),
+                "failed": failed,
+                "skippedNoLoggedDate": sorted(
+                    skipped, key=lambda k: sort_key({"key": k})
+                ),
+            },
+        )
 
     def _write_ticket(self):
         """Compare-and-swap one ticket's status into the vault.
