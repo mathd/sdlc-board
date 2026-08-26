@@ -99,10 +99,55 @@ block carrying everything frontmatter cannot: `readiness`, `links`, `comments`, 
 the source corpus has 1,915 comment bodies and ~44 distinct ad-hoc `context` keys, and `pr` appears
 in five different shapes.
 
+## Running the board
+
+```sh
+export FNS_API=... FNS_TOKEN=... FNS_VAULT=sdlc FNS_CLIENT=sdlcBoard
+python3 server.py 8787          # http://localhost:8787/board.html
+```
+
+`SDLC_MIRROR` sets the on-disk mirror location (default `~/.cache/sdlc-board`).
+
+`server.py` binds 127.0.0.1 and is unauthenticated **because** of that. The assumption is
+load-bearing: do not change the bind address without adding authentication.
+
+### The bulk download is PULL-based
+
+The single most surprising part of the protocol. `NoteSync` does not push the notes: the server
+queues the pages and waits ("默认不自动发送，等待客户端拉取", `ws_note.go:1209`). Nothing arrives
+until the client sends `NoteSyncPageAck`, and that ack **requires a `vault` field** even though the
+context already identifies the sync. A client that only sends `NoteSync` connects, authenticates,
+receives `NoteSyncEnd` with `needModifyCount: 272`, and then waits forever having received nothing.
+
+Page indexes on the wire are 1-based while the ack is 0-based, and the client never acks the last
+page (`ws_sync_download_cache.go:120-124, 140-156`).
+
+### The mirror must remember the server's mtime
+
+The reconciliation skip condition requires **both** `contentHash` and `mtime` to match
+(`ws_note.go:1020`). An inventory reporting `mtime: 0` matches nothing, so every note falls through
+to a resend or a `NoteSyncNeedPush` on every single reconnect — 270 of them here before the fix,
+zero after. The mirror persists the server's `mtime`/`ctime` per note alongside the content.
+
 ## Status
 
 - **Phase 0 complete.** Facts above.
 - **Phase 1 complete.** All 272 tickets migrated; all 272 read back from the vault byte-identical
   to their source render, all 272 server hashes match, zero lossy fields.
-- Phase 2 (WebSocket read path) not started. `server.py` is still the git-backed original and is
-  **not** wired to the vault yet.
+- **Phase 2 complete.** `server.py` has no git code at all; `/board` renders from the mirror.
+  Verified: a vault edit reaches the board in **~1s**; killing the socket and writing while
+  disconnected **converges in ~2s with no restart**; starting with FNS unreachable renders 272
+  tickets read-only from disk. Mutation-checked — replacing `_sync_vault` with a no-op leaves the
+  gap unrepaired.
+  - The board is **read-only** for the whole of Phase 2: `POST /ticket` and `POST /archive` return
+    503, and `/history` and `/metrics` return empty with an `unavailable` note rather than serving
+    stale git-derived data.
+  - The WS client is **structurally** read-only (trap #6): the only actions it can send are
+    `Authorization`, `ClientInfo`, `NoteSync` and `NoteSyncPageAck`. `NoteModify`/`NoteDelete`/
+    `NoteRename` do not exist in the file, and `delNotes` is a hardcoded `[]` because the server
+    deletes whatever is listed there (`ws_note.go:842-870`).
+  - `NoteSyncNeedPush` is logged and ignored (trap #7).
+- **Not verified:** the two-vault case (§10 "each vault catches up after a reconnect"). Watermarks
+  are per vault and reload independently, but the token's allowlist covers only `sdlc`, so the
+  convergence test itself has not been run. Do it before relying on Phase 5.
+- Phase 3 (REST write path) not started.

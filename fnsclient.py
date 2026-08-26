@@ -1,0 +1,534 @@
+#!/usr/bin/env python3
+"""Read-only Fast Note Sync WebSocket client for the board mirror.
+
+Structurally read-only (plan §Phase 2, trap #6): the only client-to-server
+actions implemented are Authorization, ClientInfo and NoteSync. NoteModify,
+NoteDelete and NoteRename are deliberately absent, so a mirror bug cannot
+corrupt the shared vault -- the code to do so does not exist.
+
+Two related safeguards:
+  * NoteSync is sent with an empty `delNotes`. The server DELETES anything
+    listed there (ws_note.go:842-870); a mirror must never populate it.
+  * NoteSyncNeedPush is logged and ignored (trap #7). The server sends it when
+    it believes we hold a newer copy; answering it would mean uploading.
+
+Timestamps are milliseconds (Phase 0, measured). `lastTime` is server-assigned
+and is the watermark; `mtime` is client-supplied and must never be used as one.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import os
+import socket
+import struct
+import threading
+import time
+from urllib.parse import urlparse
+
+from vault import encode_hash32
+
+WS_TEXT = 0x1
+WS_BINARY = 0x2
+WS_CLOSE = 0x8
+WS_PING = 0x9
+WS_PONG = 0xA
+
+
+class WSError(Exception):
+    pass
+
+
+class _Socket:
+    """Minimal RFC 6455 client. Text frames only, plus ping/pong."""
+
+    def __init__(self, url: str, headers: dict[str, str], timeout: float = 30.0):
+        u = urlparse(url)
+        self.host = u.hostname
+        self.port = u.port or (443 if u.scheme == "wss" else 80)
+        path = u.path or "/"
+        if u.query:
+            path += "?" + u.query
+        if u.scheme == "wss":
+            msg = "wss is not supported; the board talks to a LAN server over ws"
+            raise WSError(msg)
+
+        self.sock = socket.create_connection((self.host, self.port), timeout=timeout)
+        key = base64.b64encode(os.urandom(16)).decode()
+        lines = [
+            f"GET {path} HTTP/1.1",
+            f"Host: {self.host}:{self.port}",
+            "Upgrade: websocket",
+            "Connection: Upgrade",
+            f"Sec-WebSocket-Key: {key}",
+            "Sec-WebSocket-Version: 13",
+        ]
+        lines += [f"{k}: {v}" for k, v in headers.items()]
+        self.sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
+
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                msg = "connection closed during handshake"
+                raise WSError(msg)
+            buf += chunk
+        status = buf.split(b"\r\n", 1)[0].decode(errors="replace")
+        if "101" not in status:
+            raise WSError(f"handshake failed: {status}")
+        self._rest = buf.split(b"\r\n\r\n", 1)[1]
+        self._lock = threading.Lock()
+
+    # -- framing -------------------------------------------------------
+
+    def _recv_exact(self, n: int) -> bytes:
+        out = self._rest[:n]
+        self._rest = self._rest[n:]
+        while len(out) < n:
+            chunk = self.sock.recv(n - len(out))
+            if not chunk:
+                msg = "connection closed"
+                raise WSError(msg)
+            out += chunk
+        return out
+
+    def send_text(self, payload: str) -> None:
+        body = payload.encode()
+        mask = os.urandom(4)
+        header = bytearray([0x80 | WS_TEXT])
+        n = len(body)
+        if n < 126:
+            header.append(0x80 | n)
+        elif n < 65536:
+            header.append(0x80 | 126)
+            header += struct.pack(">H", n)
+        else:
+            header.append(0x80 | 127)
+            header += struct.pack(">Q", n)
+        header += mask
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(body))
+        with self._lock:
+            self.sock.sendall(bytes(header) + masked)
+
+    def recv_message(self) -> tuple[int, bytes] | None:
+        """Returns (opcode, payload), reassembling continuation frames."""
+        opcode = None
+        data = b""
+        while True:
+            h = self._recv_exact(2)
+            fin = h[0] & 0x80
+            op = h[0] & 0x0F
+            length = h[1] & 0x7F
+            if length == 126:
+                length = struct.unpack(">H", self._recv_exact(2))[0]
+            elif length == 127:
+                length = struct.unpack(">Q", self._recv_exact(8))[0]
+            payload = self._recv_exact(length) if length else b""
+            if op in (WS_PING, WS_PONG, WS_CLOSE):
+                return op, payload
+            if op != 0:
+                opcode = op
+            data += payload
+            if fin:
+                return opcode or WS_TEXT, data
+
+    def send_pong(self, payload: bytes) -> None:
+        mask = os.urandom(4)
+        header = bytearray([0x80 | WS_PONG, 0x80 | len(payload)])
+        header += mask
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        with self._lock:
+            self.sock.sendall(bytes(header) + masked)
+
+    def close(self) -> None:
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+class VaultMirror:
+    """Keeps an in-memory + on-disk mirror of one or more vaults.
+
+    The mirror is the board's read source. It survives restarts on disk, so a
+    board started with the server unreachable still renders yesterday's state.
+    """
+
+    def __init__(self, mirror_dir, vaults):
+        self.dir = mirror_dir
+        self.vaults = list(vaults)
+        self.notes: dict[str, dict[str, str]] = {v: {} for v in self.vaults}
+        # Per-note server timestamps. The reconciliation skip condition requires
+        # BOTH contentHash AND mtime to match (ws_note.go:1020); reporting mtime=0
+        # makes every note fall through to a resend or NoteSyncNeedPush on every
+        # reconnect, so the mirror must remember what the server told it.
+        self.meta: dict[str, dict[str, dict]] = {v: {} for v in self.vaults}
+        # Watermarks are PER VAULT (trap #4). One shared lastTime leaves one
+        # project permanently behind while another looks fine.
+        self.last_time: dict[str, int] = {v: 0 for v in self.vaults}
+        self.lock = threading.RLock()
+        self.connected = False
+        self.last_sync_at = 0.0
+        self._load()
+
+    # -- disk ----------------------------------------------------------
+
+    def _vault_dir(self, vault: str):
+        return self.dir / vault
+
+    def _meta_path(self, vault: str):
+        return self._vault_dir(vault) / "_mirror.json"
+
+    def _load(self) -> None:
+        for v in self.vaults:
+            vd = self._vault_dir(v)
+            if not vd.exists():
+                continue
+            meta_path = self._meta_path(v)
+            if meta_path.exists():
+                try:
+                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                    self.last_time[v] = int(meta.get("lastTime", 0))
+                    self.meta[v] = meta.get("notes", {}) or {}
+                    # Age of the data must survive a restart, or an offline
+                    # board cannot say how stale it is.
+                    self.last_sync_at = max(
+                        self.last_sync_at, float(meta.get("syncedAt") or 0)
+                    )
+                except (ValueError, OSError):
+                    self.last_time[v] = 0
+                    self.meta[v] = {}
+            for p in vd.rglob("*.md"):
+                rel = p.relative_to(vd).as_posix()
+                try:
+                    self.notes[v][rel] = p.read_text(encoding="utf-8")
+                except OSError:
+                    continue
+
+    def _persist_note(self, vault: str, path: str, content: str) -> None:
+        target = self._vault_dir(vault) / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        tmp.write_text(content, encoding="utf-8")
+        tmp.replace(target)
+
+    def _remove_note(self, vault: str, path: str) -> None:
+        target = self._vault_dir(vault) / path
+        try:
+            target.unlink()
+        except FileNotFoundError:
+            pass
+
+    def _persist_meta(self, vault: str) -> None:
+        vd = self._vault_dir(vault)
+        vd.mkdir(parents=True, exist_ok=True)
+        self._meta_path(vault).write_text(
+            json.dumps(
+                {
+                    "lastTime": self.last_time[vault],
+                    "notes": self.meta.get(vault, {}),
+                    "syncedAt": self.last_sync_at,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    # -- mutations (local only; never sent upstream) --------------------
+
+    def apply_modify(self, vault: str, path: str, content: str,
+                     mtime: int = 0, ctime: int = 0) -> None:
+        with self.lock:
+            self.notes.setdefault(vault, {})[path] = content
+            if mtime or ctime:
+                self.meta.setdefault(vault, {})[path] = {
+                    "mtime": mtime,
+                    "ctime": ctime,
+                }
+            self._persist_note(vault, path, content)
+            self._persist_meta(vault)
+
+    def apply_delete(self, vault: str, path: str) -> None:
+        with self.lock:
+            self.notes.setdefault(vault, {}).pop(path, None)
+            self.meta.setdefault(vault, {}).pop(path, None)
+            self._remove_note(vault, path)
+
+    def apply_rename(self, vault: str, old: str, new: str) -> None:
+        with self.lock:
+            notes = self.notes.setdefault(vault, {})
+            content = notes.pop(old, None)
+            self._remove_note(vault, old)
+            if content is not None:
+                notes[new] = content
+                self._persist_note(vault, new, content)
+
+    def set_watermark(self, vault: str, last_time: int) -> None:
+        with self.lock:
+            if last_time > self.last_time.get(vault, 0):
+                self.last_time[vault] = last_time
+                self._persist_meta(vault)
+
+    def inventory(self, vault: str) -> list[dict]:
+        """The client's own note list, for the server to compute a real delta.
+
+        contentHash is recomputed locally rather than carried from the server:
+        POST /api/note stores a client-supplied hash verbatim without
+        validating it (Phase 0), so a stored hash is not trustworthy.
+        """
+        with self.lock:
+            out = []
+            meta = self.meta.get(vault, {})
+            for path, content in self.notes.get(vault, {}).items():
+                m = meta.get(path) or {}
+                out.append(
+                    {
+                        "path": path,
+                        "pathHash": encode_hash32(path),
+                        "contentHash": encode_hash32(content),
+                        "mtime": int(m.get("mtime") or 0),
+                        "ctime": int(m.get("ctime") or 0),
+                    }
+                )
+            return out
+
+    def snapshot(self, vault: str) -> dict[str, str]:
+        with self.lock:
+            return dict(self.notes.get(vault, {}))
+
+    def age_seconds(self) -> float:
+        return time.time() - self.last_sync_at if self.last_sync_at else float("inf")
+
+
+class FNSReadClient(threading.Thread):
+    """Connects, authenticates, reconciles per vault, applies broadcasts.
+
+    Reconnect is the repair mechanism, not an error path (trap #4): a dropped
+    connection means missed broadcasts, and re-running NoteSync on reconnect is
+    the only thing that repairs it.
+    """
+
+    daemon = True
+
+    def __init__(self, api, token, vaults, mirror, client_type="sdlcBoard",
+                 client_name="sdlc-board", on_change=None):
+        super().__init__(name="fns-read-client")
+        self.api = api.rstrip("/")
+        self.token = token
+        self.vaults = list(vaults)
+        self.mirror = mirror
+        self.client_type = client_type
+        self.client_name = client_name
+        self.on_change = on_change
+        self.stop_flag = threading.Event()
+        self._ws = None
+
+    # -- protocol helpers ----------------------------------------------
+
+    def _ws_url(self) -> str:
+        u = urlparse(self.api)
+        return f"ws://{u.hostname}:{u.port or 80}/api/user/sync"
+
+    def _send(self, action: str, payload) -> None:
+        # Authorization carries the RAW token, not JSON (websocket.go:1166).
+        body = payload if isinstance(payload, str) else json.dumps(payload)
+        self._ws.send_text(f"{action}|{body}")
+
+    def _expect(self, timeout=30.0):
+        self._ws.sock.settimeout(timeout)
+        op, raw = self._ws.recv_message()
+        if op == WS_PING:
+            self._ws.send_pong(raw)
+            return self._expect(timeout)
+        if op == WS_CLOSE:
+            msg = "server closed the connection"
+            raise WSError(msg)
+        text = raw.decode("utf-8", errors="replace")
+        action, _, payload = text.partition("|")
+        try:
+            env = json.loads(payload) if payload else {}
+        except ValueError:
+            env = {}
+        return action, env
+
+    # -- handshake ------------------------------------------------------
+
+    def _connect(self) -> None:
+        self._ws = _Socket(
+            self._ws_url(),
+            {
+                "x-client": self.client_type,
+                "x-client-name": self.client_name,
+                "x-client-version": "1.0.0",
+            },
+        )
+        self._send("Authorization", self.token)
+        action, env = self._expect()
+        if env.get("code") != 1:
+            raise WSError(f"auth failed: {env.get('code')} {env.get('message')}")
+
+        self._send(
+            "ClientInfo",
+            {
+                "name": self.client_name,
+                "version": "1.0.0",
+                "type": self.client_type,
+                "offlineSyncStrategy": "newTimeMerge",
+            },
+        )
+        self._expect()
+
+    def _sync_vault(self, vault: str) -> None:
+        """One NoteSync per vault, with that vault's inventory and watermark.
+
+        Broadcasts arrive for every vault on one connection, but reconciliation
+        does not: NoteSync names a single vault and lastTime is per vault.
+
+        The bulk download is PULL-based, not push. The server queues the pages
+        and waits ("默认不自动发送，等待客户端拉取", ws_note.go:1209): nothing
+        arrives until the client sends NoteSyncPageAck. Page indexes on the
+        wire are 1-based while the ack is 0-based, and the client never acks
+        the last page (ws_sync_download_cache.go:120-124, 140-156).
+        """
+        context = f"sync-{vault}-{int(time.time() * 1000)}"
+        self._send(
+            "NoteSync",
+            {
+                "vault": vault,
+                "context": context,
+                "lastTime": self.mirror.last_time.get(vault, 0),
+                "notes": self.mirror.inventory(vault),
+                "delNotes": [],  # never populate: the server DELETES these
+                "missingNotes": [],
+            },
+        )
+        pending_watermark = None
+        while not self.stop_flag.is_set():
+            action, env = self._expect()
+            data = env.get("data") or {}
+
+            if action == "NoteSyncEnd":
+                for queued in data.get("messages") or []:
+                    self._dispatch(
+                        queued.get("action", ""),
+                        {"data": queued.get("data"), "vault": vault},
+                    )
+                pending_watermark = data.get("lastTime") or pending_watermark
+                if not (data.get("needModifyCount") or data.get("needDeleteCount")):
+                    break
+                # Pages are queued but unsent; -1 starts the pull.
+                self._send(
+                    "NoteSyncPageAck",
+                    {"context": context, "vault": vault, "pageIndex": -1},
+                )
+                continue
+
+            if action == "NoteSyncPage":
+                if data.get("isLast"):
+                    break  # last page's details follow, then we are done
+                self._send(
+                    "NoteSyncPageAck",
+                    {
+                        "context": context,
+                        "vault": vault,
+                        "pageIndex": data.get("pageIndex", 0),
+                    },
+                )
+                continue
+
+            self._dispatch(action, env, default_vault=vault)
+
+        # Drain the final page's detail messages, which arrive after the
+        # isLast metadata frame.
+        deadline = time.time() + 20
+        while not self.stop_flag.is_set() and time.time() < deadline:
+            try:
+                action, env = self._expect(timeout=3.0)
+            except (WSError, OSError):
+                break
+            if action in ("NoteSyncPage", "NoteSyncEnd"):
+                continue
+            self._dispatch(action, env, default_vault=vault)
+
+        if pending_watermark:
+            self.mirror.set_watermark(vault, int(pending_watermark))
+
+    # -- message handling -----------------------------------------------
+
+    def _dispatch(self, action: str, env: dict, default_vault: str | None = None) -> None:
+        data = env.get("data") or {}
+        vault = env.get("vault") or default_vault
+        if not vault:
+            return
+
+        if action == "NoteSyncModify":
+            path = data.get("path")
+            if path is not None and data.get("content") is not None:
+                self.mirror.apply_modify(
+                    vault,
+                    path,
+                    data["content"],
+                    mtime=int(data.get("mtime") or 0),
+                    ctime=int(data.get("ctime") or 0),
+                )
+                self._changed()
+        elif action == "NoteSyncDelete":
+            path = data.get("path")
+            if path:
+                self.mirror.apply_delete(vault, path)
+                self._changed()
+        elif action == "NoteSyncRename":
+            old = data.get("oldPath") or data.get("old_path")
+            new = data.get("path")
+            if old and new:
+                self.mirror.apply_rename(vault, old, new)
+                self._changed()
+        elif action == "NoteSyncMtime":
+            pass  # timestamp only, no content change
+        elif action == "NoteSyncNeedPush":
+            # Trap #7: the server thinks we hold a newer copy. We are read-only;
+            # log and ignore. Implementing the upload it asks for would make the
+            # mirror a writer.
+            print(f"[fns] NoteSyncNeedPush ignored (read-only): {data.get('path')}")
+
+        if data.get("lastTime"):
+            self.mirror.set_watermark(vault, int(data["lastTime"]))
+
+    def _changed(self) -> None:
+        self.mirror.last_sync_at = time.time()
+        if self.on_change:
+            self.on_change()
+
+    # -- run loop --------------------------------------------------------
+
+    def run(self) -> None:
+        backoff = 1.0
+        while not self.stop_flag.is_set():
+            try:
+                self._connect()
+                for v in self.vaults:
+                    self._sync_vault(v)
+                self.mirror.connected = True
+                self.mirror.last_sync_at = time.time()
+                backoff = 1.0
+                print(f"[fns] connected; mirroring {', '.join(self.vaults)}")
+                while not self.stop_flag.is_set():
+                    action, env = self._expect(timeout=90.0)
+                    self._dispatch(action, env)
+            except (WSError, OSError, ValueError) as e:
+                self.mirror.connected = False
+                if self.stop_flag.is_set():
+                    break
+                print(f"[fns] disconnected ({e}); retrying in {backoff:.0f}s")
+                self.stop_flag.wait(backoff)
+                backoff = min(backoff * 2, 30.0)
+            finally:
+                if self._ws:
+                    self._ws.close()
+                    self._ws = None
+        self.mirror.connected = False
+
+    def stop(self) -> None:
+        self.stop_flag.set()
+        if self._ws:
+            self._ws.close()
