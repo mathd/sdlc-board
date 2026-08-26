@@ -126,6 +126,19 @@ class _Socket:
                 length = struct.unpack(">Q", self._recv_exact(8))[0]
             payload = self._recv_exact(length) if length else b""
             if op in (WS_PING, WS_PONG, WS_CLOSE):
+                # RFC 6455 allows control frames BETWEEN fragments. Returning
+                # here mid-message would discard everything accumulated so far
+                # and truncate the note -- and a 142KB ticket is exactly the
+                # payload that fragments. Handle the control frame in place and
+                # keep reassembling.
+                if op == WS_PING:
+                    self.send_pong(payload)
+                    continue
+                if op == WS_PONG:
+                    continue
+                if data or opcode is not None:
+                    msg = "connection closed mid-message"
+                    raise WSError(msg)
                 return op, payload
             if op != 0:
                 opcode = op
@@ -177,6 +190,19 @@ class VaultMirror:
     def _vault_dir(self, vault: str):
         return self.dir / vault
 
+    def _safe_target(self, vault: str, path: str):
+        """Resolve a note path inside the vault dir, or refuse it.
+
+        Paths come from the server. A path containing `../` otherwise writes or
+        deletes files outside the mirror -- verified: it created a file in /tmp.
+        """
+        base = self._vault_dir(vault).resolve()
+        target = (base / path).resolve()
+        if target != base and base not in target.parents:
+            msg = f"note path escapes the mirror: {path!r}"
+            raise ValueError(msg)
+        return target
+
     def _meta_path(self, vault: str):
         return self._vault_dir(vault) / "_mirror.json"
 
@@ -190,7 +216,8 @@ class VaultMirror:
                 try:
                     meta = json.loads(meta_path.read_text(encoding="utf-8"))
                     self.last_time[v] = int(meta.get("lastTime", 0))
-                    self.meta[v] = meta.get("notes", {}) or {}
+                    notes_meta = meta.get("notes")
+                    self.meta[v] = notes_meta if isinstance(notes_meta, dict) else {}
                     # Age of the data must survive a restart, or an offline
                     # board cannot say how stale it is.
                     self.last_sync_at = max(
@@ -207,14 +234,14 @@ class VaultMirror:
                     continue
 
     def _persist_note(self, vault: str, path: str, content: str) -> None:
-        target = self._vault_dir(vault) / path
+        target = self._safe_target(vault, path)
         target.parent.mkdir(parents=True, exist_ok=True)
         tmp = target.with_suffix(target.suffix + ".tmp")
         tmp.write_text(content, encoding="utf-8")
         tmp.replace(target)
 
     def _remove_note(self, vault: str, path: str) -> None:
-        target = self._vault_dir(vault) / path
+        target = self._safe_target(vault, path)
         try:
             target.unlink()
         except FileNotFoundError:
@@ -258,10 +285,13 @@ class VaultMirror:
         with self.lock:
             notes = self.notes.setdefault(vault, {})
             content = notes.pop(old, None)
-            self._remove_note(vault, old)
+            # Write the destination BEFORE removing the source, so a crash
+            # between the two leaves a duplicate (self-healing on next sync)
+            # rather than nothing at all.
             if content is not None:
                 notes[new] = content
                 self._persist_note(vault, new, content)
+            self._remove_note(vault, old)
 
     def set_watermark(self, vault: str, last_time: int) -> None:
         with self.lock:
@@ -322,6 +352,7 @@ class FNSReadClient(threading.Thread):
         self.on_change = on_change
         self.stop_flag = threading.Event()
         self._ws = None
+        self._syncing = False  # True while a bulk NoteSync is in flight
 
     # -- protocol helpers ----------------------------------------------
 
@@ -391,6 +422,13 @@ class FNSReadClient(threading.Thread):
         the last page (ws_sync_download_cache.go:120-124, 140-156).
         """
         context = f"sync-{vault}-{int(time.time() * 1000)}"
+        self._syncing = True
+        try:
+            self._sync_vault_inner(vault, context)
+        finally:
+            self._syncing = False
+
+    def _sync_vault_inner(self, vault: str, context: str) -> None:
         self._send(
             "NoteSync",
             {
@@ -441,17 +479,38 @@ class FNSReadClient(threading.Thread):
         # Drain the final page's detail messages, which arrive after the
         # isLast metadata frame.
         deadline = time.time() + 20
+        drained_cleanly = True
         while not self.stop_flag.is_set() and time.time() < deadline:
             try:
                 action, env = self._expect(timeout=3.0)
-            except (WSError, OSError):
+            except OSError as e:
+                # A socket TIMEOUT is how a clean drain ends: the last page's
+                # details have all arrived and nothing more is coming. Any
+                # other socket error means the connection broke mid-drain.
+                drained_cleanly = isinstance(e, socket.timeout)
+                break
+            except WSError:
+                drained_cleanly = False
                 break
             if action in ("NoteSyncPage", "NoteSyncEnd"):
                 continue
             self._dispatch(action, env, default_vault=vault)
+        else:
+            # Ran out of wall clock with messages still arriving.
+            drained_cleanly = False
 
-        if pending_watermark:
+        # ONLY advance the watermark on a complete sync. NoteSync returns
+        # changes strictly after lastTime, so advancing it past notes that were
+        # never applied skips them PERMANENTLY -- the mirror goes silently and
+        # unrecoverably stale. Leaving it behind costs a re-sync of notes we
+        # already hold, which is cheap and self-correcting.
+        if pending_watermark and drained_cleanly:
             self.mirror.set_watermark(vault, int(pending_watermark))
+        elif pending_watermark:
+            print(
+                f"[fns] {vault}: sync did not complete; keeping watermark at "
+                f"{self.mirror.last_time.get(vault, 0)} so the next NoteSync re-fetches"
+            )
 
     # -- message handling -----------------------------------------------
 
@@ -491,7 +550,13 @@ class FNSReadClient(threading.Thread):
             # mirror a writer.
             print(f"[fns] NoteSyncNeedPush ignored (read-only): {data.get('path')}")
 
-        if data.get("lastTime"):
+        # Advance the watermark per message ONLY for live broadcasts, where
+        # each message stands alone. During a bulk NoteSync the messages arrive
+        # in pages, so a drop partway would leave the watermark past notes that
+        # were never applied -- and NoteSync only returns changes AFTER
+        # lastTime, so those notes are skipped permanently. _sync_vault sets the
+        # watermark once, at the end, and only on a complete sync.
+        if data.get("lastTime") and not self._syncing:
             self.mirror.set_watermark(vault, int(data["lastTime"]))
 
     def _changed(self) -> None:

@@ -45,7 +45,12 @@ BLOCK_FIELDS = ("readiness", "links", "comments", "context", "comment")
 DATA_FENCE = "```json sdlc-data"
 
 # Fixed, unambiguous boundary between the description and whatever follows.
-DESC_SEPARATOR = "\n<!-- /description -->"
+DESC_MARKER = "<!-- /description -->"
+DESC_SEPARATOR = "\n" + DESC_MARKER
+# A description may legitimately CONTAIN the marker -- a ticket about this very
+# migration would. Escape it on the way out and restore it on the way in, so the
+# boundary stays unambiguous without truncating real content.
+DESC_MARKER_ESCAPED = "<!-- \\/description -->"
 
 
 # ---------------------------------------------------------------- hashing
@@ -134,6 +139,11 @@ def note_from_ticket(t: dict) -> str:
     lines.append("---")
     lines.append("")
 
+    # One ticket in the corpus uses `title` instead of `summary`. The heading
+    # renders from either, and parsing back derives `summary` from the heading,
+    # so such a ticket gains a `summary` equal to its `title`. That is
+    # deliberate normalisation, not loss: the board reads `summary`, and the
+    # original `title` is preserved verbatim in the data block.
     title = t.get("summary") or t.get("title") or ""
     lines.append(f"# {t.get('key', '')}: {title}".rstrip())
     lines.append("")
@@ -149,7 +159,7 @@ def note_from_ticket(t: dict) -> str:
         # separator. Because the separator is a constant, the parser can remove
         # exactly it and recover a description whether or not it ends in a
         # newline of its own -- descriptions in the corpus do both.
-        lines.append(desc + DESC_SEPARATOR)
+        lines.append(desc.replace(DESC_MARKER, DESC_MARKER_ESCAPED) + DESC_SEPARATOR)
 
     # Everything the frontmatter cannot hold, verbatim and recoverable.
     # `pr` rides along whenever it is not a bare URL string, so the object's
@@ -241,14 +251,16 @@ def _split_prose(prose: str, key: str):
     while rest and (not rest[0].strip() or rest[0].startswith("> ")):
         rest.pop(0)  # blank line after the heading, and the wikilink block
     text = "\n".join(rest)
-    if DESC_SEPARATOR.lstrip("\n") in text:
+    if DESC_MARKER in text:
         # Cut at the explicit marker: unambiguous regardless of how the
         # description itself ends.
-        description = text[: text.index(DESC_SEPARATOR.lstrip("\n"))]
+        description = text[: text.index(DESC_MARKER)]
         if description.endswith("\n"):
             description = description[:-1]
     else:
         description = text.strip("\n") or None
+    if description:
+        description = description.replace(DESC_MARKER_ESCAPED, DESC_MARKER)
     return summary, (description or None)
 
 

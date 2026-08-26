@@ -183,6 +183,28 @@ zero after. The mirror persists the server's `mtime`/`ctime` per note alongside 
   lost update the CAS cannot see, because the guarded field never changed. Descriptions in the
   corpus both do and do not end in a newline, so the boundary has to be explicit rather than
   inferred; removing the marker costs 40 descriptions on `selfcheck`.
+- **Code review fixes (Codex, cross-model).** Eight findings validated by execution and fixed; two
+  rejected. Notable:
+  - **`_rev` was optional, so the CAS was bypassable.** A `POST /ticket` omitting it moved a ticket
+    Backlog→Done straight through the guard. `_rev` is now required and a write without it is
+    refused with 400. This is the "a precondition that cannot fail" shape: the guard was present,
+    correct, and skippable.
+  - **The watermark advanced on an incomplete sync.** Worse than reported: `_dispatch` advanced it
+    per *message*, so an interrupted bulk sync ratcheted it past notes never applied — and since
+    `NoteSync` only returns changes after `lastTime`, those notes were skipped **permanently**. Now
+    advanced once, at the end, only on a complete sync; per-message advance is limited to live
+    broadcasts, where each message stands alone. Verified: an interrupted sync holds the watermark
+    at its old value.
+  - **A note whose frontmatter key mismatched its path** was read and rewritten while reporting
+    success for the requested key — a status change applied to the wrong ticket. Now refused.
+  - Path traversal (a server-supplied `../` path wrote outside the mirror — executed, it landed in
+    `/tmp`), control frames truncating fragmented messages, rename losing the note on a crash,
+    a malformed `_mirror.json` breaking `inventory()`, and a description containing the literal
+    `<!-- /description -->` being truncated (now escaped; 0 real collisions in the corpus today).
+  - **Rejected:** the claim that `urllib.parse` is unbound in `vault.get_note` (`import
+    urllib.request` binds it — verified by reaching the network layer), and the cross-process race
+    on the CAS, which is the accepted residual of the server-side approach FNS forces (see
+    `baseHash` above), not a defect.
 - **Not verified:** the two-vault case (§10 "each vault catches up after a reconnect"). Watermarks
   are per vault and reload independently, but the token's allowlist covers only `sdlc`, so the
   convergence test itself has not been run. Do it before relying on Phase 5.

@@ -153,9 +153,17 @@ def write_ticket(key, ticket, moving_from, actor):
             except (ValueError, KeyError) as e:
                 raise VaultWriteError(f"{path} is not a parseable ticket: {e}") from e
 
+            # The note must be the ticket we were asked to write. A mismatched
+            # key means we would apply this status change to a different
+            # ticket while reporting success for this one.
+            if existing.get("key") != key:
+                raise VaultWriteError(
+                    f"{path} holds key {existing.get('key')!r}, not {key!r}"
+                )
+
             vault_status = existing.get("status")
-            # The guard. `moving_from` is None for a create or a non-move edit.
-            if moving_from is not None and vault_status != moving_from:
+            # The guard.
+            if vault_status != moving_from:
                 if vault_status == new_status:
                     # Already where we wanted it -- someone applied the same
                     # move first. Idempotent, not a conflict.
@@ -301,6 +309,23 @@ class Handler(SimpleHTTPRequestHandler):
             return
 
         moving_from = ticket.pop("_rev", None)
+        # The guard is NOT optional. Without `_rev` there is nothing to compare
+        # against, so the write would overwrite whatever the vault holds -- a
+        # silent lost update, verified: a POST omitting _rev moved a ticket
+        # Backlog -> Done straight through the CAS. Refuse instead.
+        if not isinstance(moving_from, str) or not moving_from:
+            self._json(
+                400,
+                {
+                    "error": "missing _rev",
+                    "key": key,
+                    "message": (
+                        "_rev is required: it names the status this write expects "
+                        "the vault to hold, and without it the write cannot be checked"
+                    ),
+                },
+            )
+            return
         ticket.pop("_since", None)  # server-computed, never stored
         # The actor is supplied by the caller; the server cannot infer it.
         actor = {
