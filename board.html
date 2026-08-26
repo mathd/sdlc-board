@@ -700,12 +700,19 @@ function paintVaults(b){
 const HIST = {};  // key -> events from /history (fetched on open, not per repaint)
 
 async function loadHistory(key){
+  const gen = VAULT_GEN;
   try {
-    const gen = VAULT_GEN;
     const r = await (await fetch(`/history?key=${key}${vq("&")}`)).json();
     if (gen !== VAULT_GEN) return;   // vault switched while this was in flight
     HIST[key] = r.events || [];
-  } catch { HIST[key] = []; }
+  } catch {
+    // A rejection from a request issued for the PREVIOUS vault must not blank
+    // the current vault's history: guard the failure path too, not just the
+    // success path.
+    if (gen !== VAULT_GEN) return;
+    HIST[key] = [];
+  }
+  if (gen !== VAULT_GEN) return;
   if (selectedKey === key) renderModal();
 }
 /* the human-gate actions (Gate 2/3/4), only offered on needs:human tickets */
@@ -903,9 +910,9 @@ function paint(){
 async function openMetrics(){
   document.getElementById("moverlay").classList.add("show");
   const m = document.getElementById("mmodal");
-  m.innerHTML = `<div class="mbody"><p class="empty">Computing from git history…</p></div>`;
+  m.innerHTML = `<div class="mbody"><p class="empty">Computing from the transition log…</p></div>`;
+  const gen = VAULT_GEN;
   try {
-    const gen = VAULT_GEN;
     const d = await (await fetch(`/metrics${vq("?")}`)).json();
     if (gen !== VAULT_GEN) return;   // vault switched while this was in flight
     const cols = [...BOARD.statuses.filter(s => s !== "Done"), "BLOCKED"];
@@ -932,8 +939,9 @@ async function openMetrics(){
       </table></div>
       <p class="mnote"><b>Human wait</b> = time carrying <code>needs:human</code> (Gates 2–4 — the pipeline's
       likely bottleneck). <b>Agent</b> = time carrying an <code>agent:*</code> label. Exact, not hand-tracked:
-      every transition is a commit on the state branch. Click a row for the ticket.</p></div>`;
+      every transition is a line in the vault's <code>_log/transitions.md</code>. Click a row for the ticket.</p></div>`;
   } catch(e){
+    if (gen !== VAULT_GEN) return;   // stale: belongs to the previous vault
     m.innerHTML = `<div class="mbody"><p class="empty">metrics failed: ${esc(e.message)}</p></div>`;
   }
 }
@@ -941,8 +949,8 @@ function closeMetrics(){ document.getElementById("moverlay").classList.remove("s
 async function render(){
   if (dragKey) return;                        // don't wipe drag state mid-drag
   if (document.activeElement && document.activeElement.classList.contains("archdate")) return;  // date picker open
+  const gen = VAULT_GEN;
   try {
-    const gen = VAULT_GEN;
     const fetched = await (await fetch("/board?t="+Date.now()+vq("&"))).json();
     if (gen !== VAULT_GEN) return;   // vault switched while this was in flight
     paintVaults(fetched);
@@ -966,8 +974,9 @@ async function render(){
     const now = new Date();
     document.getElementById("stamp").innerHTML = `<span class="dot"></span>live · ${now.toLocaleTimeString([], {hour12:false})}`;
   } catch(e){
+    if (gen !== VAULT_GEN) return;   // stale: belongs to the previous vault
     document.getElementById("board").innerHTML =
-      `<p style="padding:20px;color:#F68A4B">Can't load the board — is .sdlc/server.py running?<br>${esc(e.message)}</p>`;
+      `<p style="padding:20px;color:#F68A4B">Can't load the board — is server.py running?<br>${esc(e.message)}</p>`;
   }
 }
 render();

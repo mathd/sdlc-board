@@ -383,14 +383,24 @@ class FNSReadClient(threading.Thread):
         super().__init__(name="fns-read-client")
         self.api = api.rstrip("/")
         self.token = token
-        self.vaults = list(vaults)
         self.mirror = mirror
+        for v in vaults:
+            mirror._ensure_vault(v)
         self.client_type = client_type
         self.client_name = client_name
         self.on_change = on_change
         self.stop_flag = threading.Event()
         self._ws = None
         self._syncing = False  # True while a bulk NoteSync is in flight
+
+    @property
+    def vaults(self):
+        """Whatever the mirror currently knows about -- NOT a list frozen at
+        construction. A vault first seen in a broadcast after startup must also
+        be reconciled on the next reconnect, or it silently never catches up.
+        """
+        with self.mirror.lock:
+            return list(self.mirror.vaults)
 
     # -- protocol helpers ----------------------------------------------
 

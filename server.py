@@ -107,10 +107,19 @@ def board_config(vault=None):
     return boardconfig.parse(text)
 
 
+def known_vaults():
+    """Vaults the board can serve: those discovered at startup plus any the
+    mirror has since seen on the shared socket. Reading the frozen startup list
+    alone leaves a newly authorised vault permanently unreachable."""
+    with MIRROR.lock:
+        seen = list(MIRROR.vaults)
+    return sorted({*VAULTS, *seen})
+
+
 def _selected_vault(query):
     """The vault named by ?vault=, restricted to what the token may reach."""
     want = parse_qs(query).get("vault", [""])[0]
-    return want if want in VAULTS else VAULT
+    return want if want in known_vaults() else VAULT
 
 
 def tickets_from_mirror(vault=None):
@@ -176,6 +185,38 @@ def _log_write(path, content, vault=None):
     r = vault_put_note(path, content, vault)
     if r.get("code") != 1:
         raise VaultWriteError(f"{r.get('code')} {r.get('message')}")
+
+
+# Transition timestamps are whole seconds, so two writes in the same second
+# would sort ambiguously. Handing out a strictly increasing value under the
+# write lock keeps the log's order equal to the order the writes committed.
+_LAST_TS = [0]
+
+
+def _next_transition_time():
+    """A non-decreasing transition timestamp, unique per write. Call under WRITE_LOCK."""
+    now = int(time.time())
+    if now <= _LAST_TS[0]:
+        now = _LAST_TS[0] + 1
+    _LAST_TS[0] = now
+    return now
+
+
+def _comment_id(comment):
+    """Identity of a comment, for append-only merging.
+
+    Content-based on purpose: the board and the agents do not assign comment
+    ids, so identity has to come from the comment itself. Re-sending an
+    identical comment is therefore a no-op rather than a duplicate, which is
+    the behaviour a retry needs.
+    """
+    if not isinstance(comment, dict):
+        return json.dumps(comment, sort_keys=True, ensure_ascii=False)
+    return json.dumps(
+        {k: comment.get(k) for k in ("stage", "kind", "author", "body")},
+        sort_keys=True,
+        ensure_ascii=False,
+    )
 
 
 MAX_CAS_ATTEMPTS = 3  # bound the retry so a hot note cannot spin
@@ -250,12 +291,24 @@ def write_ticket(key, ticket, moving_from, actor, vault=None):
                 if field in ticket:
                     merged[field] = ticket[field]
 
-            # Append-only comments (see BOARD_WRITABLE_FIELDS above).
+            # Append-only comments (see BOARD_WRITABLE_FIELDS above), merged by
+            # IDENTITY rather than by position.
+            #
+            # Counting -- "take incoming[len(current):]" -- assumes the vault's
+            # comments are an unchanged prefix of the client's, and nothing
+            # checks that. Two ways it lost data: a gate comment added while an
+            # agent appended one concurrently gives equal lengths and the gate
+            # comment is dropped; and a reordered longer payload re-appends
+            # comments the vault already has. Both executed.
             incoming = ticket.get("comments")
             if isinstance(incoming, list):
                 current = existing.get("comments") or []
-                if len(incoming) > len(current):
-                    merged["comments"] = current + incoming[len(current) :]
+                have = {_comment_id(c) for c in current}
+                added = [c for c in incoming if _comment_id(c) not in have]
+                if added:
+                    merged["comments"] = current + added
+                else:
+                    merged["comments"] = current
             new_content = note_from_ticket(merged)
             if new_content == content:
                 return {"status": new_status, "attempts": attempt, "noop": True}
@@ -269,6 +322,14 @@ def write_ticket(key, ticket, moving_from, actor, vault=None):
                     "status": new_status,
                     "attempts": attempt,
                     "moved_from": vault_status,
+                    # Stamped INSIDE WRITE_LOCK, where the order of two racing
+                    # writes is already decided. Stamping later -- when the
+                    # append lock is acquired, which is a separate lock taken
+                    # after this one is released -- lets two transitions be
+                    # recorded in the opposite order to the one they happened
+                    # in, and no amount of sorting afterwards can repair a
+                    # timestamp that was wrong when written.
+                    "at": _next_transition_time(),
                 }
             last_error = f"{r.get('code')} {r.get('message')}"
 
@@ -294,7 +355,7 @@ class Handler(SimpleHTTPRequestHandler):
         url = urlparse(self.path)
 
         if url.path == "/vaults":
-            self._json(200, {"vaults": VAULTS, "selected": VAULT})
+            self._json(200, {"vaults": known_vaults(), "selected": VAULT})
             return
 
         if url.path == "/board":
@@ -325,7 +386,7 @@ class Handler(SimpleHTTPRequestHandler):
             if cfg.get("project"):
                 board["project"] = cfg["project"]
             board["vault"] = vault
-            board["vaults"] = VAULTS
+            board["vaults"] = known_vaults()
             tickets = tickets_from_mirror(vault)
             # _since drives the age chip on each card: when the ticket last
             # changed status, from the transition log.
@@ -536,6 +597,7 @@ class Handler(SimpleHTTPRequestHandler):
         # leaving /metrics incomplete but never wrong. Take the second, and log
         # the failure locally so the gap is visible.
         moved_from = result.pop("moved_from", None)
+        happened_at = result.pop("at", None)
         if moved_from is not None and moved_from != result["status"]:
             try:
                 translog.append_transition(
@@ -545,6 +607,7 @@ class Handler(SimpleHTTPRequestHandler):
                     moved_from,
                     result["status"],
                     actor,
+                    when=happened_at,
                 )
             except Exception as e:  # noqa: BLE001 - never fail the write on this
                 print(

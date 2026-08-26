@@ -336,6 +336,27 @@ zero after. The mirror persists the server's `mtime`/`ctime` per note alongside 
     blockquote is no longer truncated; board fetches carry a **generation counter** so a slow
     response cannot land on the wrong vault; and the final-page counter counts only page-detail
     actions.
+- **Fourth review pass (fixes' interaction).** 8 of the 11 previous fixes confirmed correct; 3 were
+  insufficient and are now fixed properly:
+  - **Append-only comments were merged by COUNTING, which loses data.** `incoming[len(current):]`
+    assumes the vault's comments are an unchanged prefix of the client's, and nothing checked that.
+    Executed: a gate comment added while an agent appended one concurrently gives equal lengths and
+    the gate comment is silently dropped — the exact loss the fix was added to prevent — and a
+    reordered longer payload re-appends comments the vault already has. Comments now merge by
+    **identity** (stage/kind/author/body), so a re-sent comment is a no-op, a stale array cannot
+    delete, and a CAS retry is idempotent.
+  - **Sorting the log by timestamp could not fix an out-of-order timestamp.** The transition was
+    stamped when the append lock was acquired, which is a *different* lock taken after the write
+    lock is released — so two writes ordered correctly by the CAS could be stamped in reverse. The
+    timestamp is now taken **inside** `WRITE_LOCK`, and is strictly increasing, so two transitions
+    in the same second still order correctly.
+  - **`_ensure_vault` fixed the crash but not the staleness.** It updated only the mirror's vault
+    list; the read client's reconnect loop and the server's allowlist kept their own frozen copies,
+    so a vault first seen after startup was never reconciled and `?vault=` still rejected it. All
+    three now read one source of truth.
+  - Also: the three `catch` blocks in `board.html` were unguarded — a stale rejection from the
+    previous vault blanked the current vault's history or painted an error over its board.
+    Browser-verified, and mutation-checked against the unguarded version.
 - **Not verified:** the two-vault case (§10 "each vault catches up after a reconnect"). Watermarks
   are per vault and reload independently, but the token's allowlist covers only `sdlc`, so the
   convergence test itself has not been run. Do it before relying on Phase 5.
