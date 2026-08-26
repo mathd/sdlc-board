@@ -23,6 +23,7 @@ import struct
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -388,6 +389,40 @@ def cmd_migrate(args) -> int:
     return 1 if fail else 0
 
 
+def cmd_log(args) -> int:
+    """Manually append one transition line.
+
+    A repair tool for a line `server.py` failed to write (it prints
+    "TRANSITION LOG GAP" when that happens). Agents must NOT use this: they set
+    role/model/effort on the POST /ticket body and the server logs them, so
+    appending here too would double-log every agent transition.
+    """
+    import translog
+
+    if not TOKEN:
+        print("FNS_TOKEN is not set", file=sys.stderr)
+        return 2
+
+    def read(path):
+        try:
+            return (get_note(path).get("data") or {}).get("content")
+        except urllib.error.HTTPError:
+            return None
+
+    def write(path, content):
+        r = put_note(path, content)
+        if r.get("code") != 1:
+            msg = f"{r.get('code')} {r.get('message')}"
+            raise RuntimeError(msg)
+
+    actor = {"role": args.role, "model": args.model, "effort": args.effort}
+    line = translog.append_transition(
+        read, write, args.key, args.get_from, args.to, actor
+    )
+    print(line)
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -401,6 +436,15 @@ def main() -> int:
     m.add_argument("--limit", type=int, default=0)
     m.add_argument("--dry-run", action="store_true")
     m.set_defaults(func=cmd_migrate)
+
+    lg = sub.add_parser("log", help="manually append one transition (repair tool)")
+    lg.add_argument("key")
+    lg.add_argument("get_from", metavar="FROM")
+    lg.add_argument("to", metavar="TO")
+    lg.add_argument("--role", default="human")
+    lg.add_argument("--model", default="")
+    lg.add_argument("--effort", default="")
+    lg.set_defaults(func=cmd_log)
 
     s = sub.add_parser("selfcheck", help="round-trip tickets, report lossy fields")
     s.add_argument("--source", default=str(default_src))

@@ -223,6 +223,27 @@ zero after. The mirror persists the server's `mtime`/`ctime` per note alongside 
     inputs onto one rendering, so a description already containing `<!-- \/description -->` came
     back altered. Now escapes the escape character first and unescapes in mirror-image order;
     14 adversarial cases (nested, repeated, sentinel-only) round-trip exactly.
+- **Phase 4 complete.** `_log/transitions.md` is the timing source; `/history`, `/metrics` and each
+  card's `_since` are derived from it, and no git shape survives.
+  - **`server.py` is the only writer, and appends are serialised behind a lock.** This is not
+    optional: Phase 0 measured 50 concurrent appends keeping **1 line** (and destroying the
+    pre-existing content) against 50/50 serial. Mutation-checked in isolation — replacing the lock
+    with a null context drops 50 appends to 4.
+  - **The append happens only after the ticket write is confirmed.** The two have no transaction
+    between them. Appending first would record transitions that never happened and corrupt
+    `/metrics` with no way to tell; appending second loses a line when the append fails, leaving
+    `/metrics` incomplete but never wrong. Verified: a failing append still returns 200 for the
+    write, reports `logged: false`, and prints `TRANSITION LOG GAP` for repair. Neither a no-op
+    move nor a *refused* one is logged.
+  - `vault.py log KEY FROM TO` is the manual repair tool for such a gap. Agents must not use it:
+    they set `role`/`model`/`effort` on the `POST /ticket` body and the server logs them, so
+    appending separately would double-log every agent transition.
+  - Metrics were verified against values **derived from the requirement** (a status is held from
+    the transition into it until the next one), not read off a run — an assertion written by
+    observing what the code did pins the behaviour, not the rule. §10's mutation (remove one log
+    line) changes the output.
+  - The log is read from the **mirror**, not the vault, so `/metrics` costs no round trip and
+    survives the vault being unreachable.
 - **Not verified:** the two-vault case (§10 "each vault catches up after a reconnect"). Watermarks
   are per vault and reload independently, but the token's allowlist covers only `sdlc`, so the
   convergence test itself has not been run. Do it before relying on Phase 5.

@@ -38,6 +38,7 @@ from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+import translog
 from fnsclient import FNSReadClient, VaultMirror
 from vault import get_note as vault_get_note
 from vault import note_from_ticket, ticket_from_note
@@ -67,6 +68,15 @@ CLIENT_THREAD = None
 def sort_key(t):
     prefix, _, num = t["key"].rpartition("-")
     return (prefix, int(num))
+
+
+def _log_text():
+    """The transition log, served from the MIRROR -- no vault round trip.
+
+    The log is a note like any other, so the WebSocket mirror already holds a
+    current copy and it stays readable when the vault is unreachable.
+    """
+    return MIRROR.snapshot(VAULT).get(translog.LOG_PATH, "")
 
 
 def tickets_from_mirror(vault=VAULT):
@@ -109,6 +119,22 @@ class VaultWriteError(Exception):
 # back over a fresher one.
 BOARD_WRITABLE_FIELDS = ("status", "labels", "assignee", "pr", "classification",
                          "parent", "type")
+
+def _log_read(path):
+    """Read a note for the transition log, or None if it does not exist yet."""
+    try:
+        envelope = vault_get_note(path)
+    except Exception:  # noqa: BLE001 - absent note, or vault unreachable
+        return None
+    data = envelope.get("data")
+    return data.get("content") if data else None
+
+
+def _log_write(path, content):
+    r = vault_put_note(path, content)
+    if r.get("code") != 1:
+        raise VaultWriteError(f"{r.get('code')} {r.get('message')}")
+
 
 MAX_CAS_ATTEMPTS = 3  # bound the retry so a hot note cannot spin
 
@@ -190,7 +216,11 @@ def write_ticket(key, ticket, moving_from, actor):
             except Exception as e:  # noqa: BLE001
                 raise VaultWriteError(str(e)) from e
             if r.get("code") == 1:
-                return {"status": new_status, "attempts": attempt}
+                return {
+                    "status": new_status,
+                    "attempts": attempt,
+                    "moved_from": vault_status,
+                }
             last_error = f"{r.get('code')} {r.get('message')}"
 
         raise VaultWriteError(f"gave up after {MAX_CAS_ATTEMPTS} attempts: {last_error}")
@@ -216,7 +246,15 @@ class Handler(SimpleHTTPRequestHandler):
 
         if url.path == "/board":
             board = json.loads(CONFIG.read_text(encoding="utf-8"))
-            board["tickets"] = tickets_from_mirror()
+            tickets = tickets_from_mirror()
+            # _since drives the age chip on each card: when the ticket last
+            # changed status, from the transition log.
+            events = translog.read_events(_log_text())
+            for t in tickets:
+                ev = events.get(t["key"])
+                if ev:
+                    t["_since"] = ev[-1]["ts"]
+            board["tickets"] = tickets
             board["now"] = int(time.time())
             # Writes need the vault: offline the board is readable but not
             # writable, and says so with the age of the data.
@@ -236,27 +274,16 @@ class Handler(SimpleHTTPRequestHandler):
             if not KEY_RE.match(key):
                 self.send_error(400, "bad key")
                 return
-            # Deliberately empty, not git-derived: the git timeline stops at the
-            # migration, and reporting it as current would be a lie. Phase 4
-            # rebuilds this from _log/transitions.md.
-            self._json(
-                200,
-                {
-                    "key": key,
-                    "events": [],
-                    "unavailable": "history is rebuilt from the transition log in Phase 4",
-                },
-            )
+            self._json(200, {"key": key, "events": translog.history(_log_text(), key)})
             return
 
         if url.path == "/metrics":
+            now = int(time.time())
+            statuses = {t["key"]: t.get("status") for t in tickets_from_mirror()}
+            rows = translog.all_analysis(_log_text(), now, statuses)
             self._json(
                 200,
-                {
-                    "now": int(time.time()),
-                    "tickets": [],
-                    "unavailable": "metrics are rebuilt from the transition log in Phase 4",
-                },
+                {"now": now, "tickets": sorted(rows.values(), key=sort_key)},
             )
             return
 
@@ -354,6 +381,26 @@ class Handler(SimpleHTTPRequestHandler):
         except VaultWriteError as e:
             self._json(502, {"error": "vault write failed", "key": key, "detail": str(e)})
             return
+
+        # Append AFTER the write is confirmed. The two have no transaction
+        # between them, so pick the failure you prefer: appending first records
+        # transitions that never happened and corrupts /metrics with no way to
+        # tell, while appending second loses a line when the append fails --
+        # leaving /metrics incomplete but never wrong. Take the second, and log
+        # the failure locally so the gap is visible.
+        moved_from = result.pop("moved_from", None)
+        if moved_from is not None and moved_from != result["status"]:
+            try:
+                translog.append_transition(
+                    _log_read, _log_write, key, moved_from, result["status"], actor
+                )
+            except Exception as e:  # noqa: BLE001 - never fail the write on this
+                print(
+                    f"[board] TRANSITION LOG GAP: {key} {moved_from} -> "
+                    f"{result['status']} was not logged: {e}",
+                    file=sys.stderr,
+                )
+                result["logged"] = False
 
         self._json(200, {"ok": True, "key": key, **result})
 
