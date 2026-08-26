@@ -44,6 +44,9 @@ BLOCK_FIELDS = ("readiness", "links", "comments", "context", "comment")
 
 DATA_FENCE = "```json sdlc-data"
 
+# Fixed, unambiguous boundary between the description and whatever follows.
+DESC_SEPARATOR = "\n<!-- /description -->"
+
 
 # ---------------------------------------------------------------- hashing
 
@@ -142,8 +145,11 @@ def note_from_ticket(t: dict) -> str:
 
     desc = t.get("description")
     if desc:
-        lines.append(desc.rstrip("\n"))
-        lines.append("")
+        # The description is emitted VERBATIM followed by a fixed two-newline
+        # separator. Because the separator is a constant, the parser can remove
+        # exactly it and recover a description whether or not it ends in a
+        # newline of its own -- descriptions in the corpus do both.
+        lines.append(desc + DESC_SEPARATOR)
 
     # Everything the frontmatter cannot hold, verbatim and recoverable.
     # `pr` rides along whenever it is not a bare URL string, so the object's
@@ -185,12 +191,65 @@ def ticket_from_note(text: str) -> dict:
         else:
             t[k] = _parse_yaml_scalar(v)
 
+    prose = body
     if DATA_FENCE in body:
         start = body.index(DATA_FENCE) + len(DATA_FENCE)
         blob = body[start:]
         blob = blob[: blob.index("\n```")]
         t.update(json.loads(blob))
+        prose = body[: body.index(DATA_FENCE)]
+
+    # The RENDERED body wins over the data block for the two fields a human can
+    # reasonably retype in Obsidian. Deriving them from the block alone makes
+    # the note display-only: a title or description edited in the editor is
+    # silently erased on the next board write, which is a lost update the CAS
+    # cannot see because the guarded field never changed.
+    summary, description = _split_prose(prose, t.get("key", ""))
+    if summary is not None:
+        t["summary"] = summary
+    if description is not None:
+        t["description"] = description
+    elif "description" in t and not (t.get("description") or "").strip():
+        t.pop("description")
     return t
+
+
+def _split_prose(prose: str, key: str):
+    """Recover (summary, description) from a rendered note body.
+
+    Returns (None, None) for anything that does not look like our own render,
+    so a hand-written note cannot lose data by being misread.
+    """
+    lines = prose.split("\n")
+    summary = None
+    idx = 0
+    for i, line in enumerate(lines):
+        if line.startswith("# "):
+            heading = line[2:].strip()
+            prefix = f"{key}:"
+            summary = (
+                heading[len(prefix) :].strip()
+                if key and heading.startswith(prefix)
+                else heading
+            )
+            idx = i + 1
+            break
+    else:
+        return None, None
+
+    rest = lines[idx:]
+    while rest and (not rest[0].strip() or rest[0].startswith("> ")):
+        rest.pop(0)  # blank line after the heading, and the wikilink block
+    text = "\n".join(rest)
+    if DESC_SEPARATOR.lstrip("\n") in text:
+        # Cut at the explicit marker: unambiguous regardless of how the
+        # description itself ends.
+        description = text[: text.index(DESC_SEPARATOR.lstrip("\n"))]
+        if description.endswith("\n"):
+            description = description[:-1]
+    else:
+        description = text.strip("\n") or None
+    return summary, (description or None)
 
 
 # ---------------------------------------------------------------- transport

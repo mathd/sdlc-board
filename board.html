@@ -604,7 +604,10 @@ function drop(e, status, el){
       t.status = status;
       dragKey = null;                  // clear before render (render skips while dragging)
       paintMoved();
-      save(t, `${t.key}: ${from} → ${status}`);
+      // _rev is no longer a git blob hash: it is the status this card is
+      // moving FROM, and the server refuses the write if the vault has
+      // since moved off it.
+      save({...t, _rev: from, role: "human"}, `${t.key}: ${from} → ${status}`);
     }
   }
   dragKey = null;
@@ -612,8 +615,13 @@ function drop(e, status, el){
 async function save(ticket, msg){
   try {
     const r = await fetch("/ticket", { method:"POST", headers:{"Content-Type":"application/json"},
-                                       body: JSON.stringify(ticket) });  // carries _rev from /board
-    if (r.status === 409){ toast("⚠ ticket changed underneath — reloaded, try again"); render(); return; }
+                                       body: JSON.stringify(ticket) });  // _rev = status moved from
+    if (r.status === 409){
+      const c = await r.json().catch(() => ({}));
+      toast(c.message || "⚠ ticket changed underneath — reloaded, try again");
+      render();
+      return;
+    }
     if (!r.ok) throw new Error(await r.text());
     toast(msg || "saved");
   } catch(err){ toast("save failed: " + err.message); }

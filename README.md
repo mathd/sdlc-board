@@ -62,6 +62,22 @@ WS handshake framing is `Authorization|<raw-token>` — the token is **not** JSO
 (`pkg/app/websocket.go:1166`). A malformed token yields `308 Session expired`, which looks exactly
 like a revoked token; if WS says 308 while REST works, suspect the client first.
 
+### `baseHash` is declared but NOT enforced on REST
+
+The plan's Phase 3 rests on `POST /api/note` honouring `baseHash` as a concurrency token. It does
+not. `NoteModifyOrCreateRequest` declares the field (`note_dto.go:27`) and the REST handler never
+reads it: it passes `params` straight to `ModifyOrCreate`, which has no `BaseHash` logic at all.
+Grepping the repo, `BaseHash` is read **only** in `ws_note.go`.
+
+Executed against the live server: a write carrying `baseHash: "definitely-not-the-current-hash"`
+returned `code: 1` and destroyed the note's content. **REST is last-writer-wins.**
+
+The one server-enforced compare-and-swap is on the WebSocket path, and only under
+`offlineSyncStrategy: manualMerge` — it returns **530** (not the 441 the plan expects; 441 is
+"Destination note already exists", a rename collision) and refuses the write. Verified: content
+stayed `ORIGINAL`. Taking it would mean giving the mirror write access, which is exactly what
+Phase 2 removed on purpose, so the board does the CAS server-side instead.
+
 ### `contentHash` on a note is not necessarily server-derived
 
 `POST /api/note` stores a client-supplied `contentHash` **verbatim without validating it** (probes
@@ -147,6 +163,26 @@ zero after. The mirror persists the server's `mtime`/`ctime` per note alongside 
     `NoteRename` do not exist in the file, and `delNotes` is a hardcoded `[]` because the server
     deletes whatever is listed there (`ws_note.go:842-870`).
   - `NoteSyncNeedPush` is logged and ignored (trap #7).
+- **Phase 3 complete.** `POST /ticket` is a server-side compare-and-swap on the status field.
+  Verified: a drag propagates to the vault and back to the board; a body edit in Obsidian followed
+  by a move succeeds **and keeps the edit**; two racing drags from one status produce exactly one
+  winner and one 409 naming both values. Mutation-checked — removing the guard makes both racing
+  drags return 200 and silently lose one.
+  - **Browser-verified**, per AGENTS.md: a real Chrome drag of TKT-209 Ready→Planning fired the
+    board's own handlers, and re-reading the vault confirmed `status: "Planning"` landed. The
+    board's DoR and workflow gates refused two earlier drags, which is them working.
+  - `_rev` is no longer a git blob hash: it is the status the card is moving **from**.
+  - Only `status`, `labels`, `assignee`, `pr`, `classification`, `parent` and `type` are writable
+    from the board. A drag sends the whole ticket, and merging all of it over the vault's note
+    silently destroyed a description edited in Obsidian during testing — the client cannot
+    influence a field outside that set rather than being trusted not to send one.
+- **Note format changed in Phase 3 (vault re-migrated).** The rendered body is now the source of
+  truth for `summary` and `description`, and a `<!-- /description -->` marker bounds the
+  description. Before this, the body was *derived* from the data block and re-rendered from it, so
+  anything a human typed in Obsidian outside that block was erased on the next board write — a
+  lost update the CAS cannot see, because the guarded field never changed. Descriptions in the
+  corpus both do and do not end in a newline, so the boundary has to be explicit rather than
+  inferred; removing the marker costs 40 descriptions on `selfcheck`.
 - **Not verified:** the two-vault case (§10 "each vault catches up after a reconnect"). Watermarks
   are per vault and reload independently, but the token's allowlist covers only `sdlc`, so the
   convergence test itself has not been run. Do it before relying on Phase 5.
