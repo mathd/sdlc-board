@@ -311,6 +311,31 @@ zero after. The mirror persists the server's `mtime`/`ctime` per note alongside 
     truncates silently; the first working pull wrote back only 99 of 272 tickets and reported
     success. `_list_note_paths` pages until the rows run out, and the only reliable stop condition
     is an empty page, never a short one.
+- **Third review pass (Codex).** Fourteen findings; eleven validated and fixed, three accepted as
+  already-correct or documented. The two that mattered most:
+  - **Every gate button was broken — a regression I introduced.** Making `_rev` mandatory in the
+    previous round left `gateAction` sending no `_rev`, so Gates 2/3/4 mutated the card in memory
+    and were then rejected with 400: a false UI state that persisted nothing. My regression suite
+    only ever tested drags, so it stayed green through a broken feature. Fixed and **browser-
+    verified** end to end: Gate 2 moved a ticket Planning→Building in the vault, swapped
+    `needs:human` for `agent:coding`, persisted the gate comment, and logged the transition.
+  - **`vault.py pull --prune` deleted tickets from the git archive on a transient error.** A note
+    that failed to fetch, came back empty, or would not parse counted as "not seen" and had its
+    JSON deleted — from the rollback copy — while the command exited 0. Executed against all four
+    failure modes. Prune now runs only on positive evidence (the vault's own listing), refuses
+    entirely when anything was skipped, and a skipped pull exits 1.
+  - Also fixed: comments are now **append-only** on a board write (adding them to the writable set
+    naively would have let a stale drag delete an agent's comment — one fix creating another bug);
+    the transition log is ordered by **timestamp**, not file position, and takes a **cross-process
+    flock** so `vault.py log` cannot race the server (mutation-checked: without it, 5 of 10
+    concurrent appends are lost); a dated archive reads the date of the transition that entered
+    **Done** rather than of whatever happened last; an unknown vault in a broadcast no longer
+    kills the mirror thread with a `KeyError`; the config parser accepts **block-style YAML**
+    (it silently fell back to defaults, so a vault could render the wrong workflow); the note data
+    block is a **denylist** so unknown fields survive; a description opening with a Markdown
+    blockquote is no longer truncated; board fetches carry a **generation counter** so a slow
+    response cannot land on the wrong vault; and the final-page counter counts only page-detail
+    actions.
 - **Not verified:** the two-vault case (§10 "each vault catches up after a reconnect"). Watermarks
   are per vault and reload independently, but the token's allowlist covers only `sdlc`, so the
   convergence test itself has not been run. Do it before relying on Phase 5.

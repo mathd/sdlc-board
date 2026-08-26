@@ -29,6 +29,11 @@ from urllib.parse import urlparse
 
 from vault import encode_hash32
 
+# The server-to-client actions that make up a sync page's details.
+PAGE_DETAIL_ACTIONS = frozenset(
+    {"NoteSyncModify", "NoteSyncDelete", "NoteSyncRename", "NoteSyncMtime"}
+)
+
 WS_TEXT = 0x1
 WS_BINARY = 0x2
 WS_CLOSE = 0x8
@@ -263,9 +268,27 @@ class VaultMirror:
 
     # -- mutations (local only; never sent upstream) --------------------
 
+    def _ensure_vault(self, vault: str) -> None:
+        """Accept a vault we did not know about at startup.
+
+        VAULTS is discovered once at import, but the shared socket carries
+        broadcasts for EVERY vault the user can reach -- including one added or
+        newly authorised after the process started. Without this the first such
+        broadcast raises KeyError inside the sole mirror thread, which dies
+        while `connected` stays true and every board silently freezes.
+        """
+        if vault not in self.notes:
+            self.notes[vault] = {}
+            self.meta[vault] = {}
+            self.last_time.setdefault(vault, 0)
+            if vault not in self.vaults:
+                self.vaults.append(vault)
+            print(f"[fns] mirroring newly seen vault: {vault}")
+
     def apply_modify(self, vault: str, path: str, content: str,
                      mtime: int = 0, ctime: int = 0) -> None:
         with self.lock:
+            self._ensure_vault(vault)
             self.notes.setdefault(vault, {})[path] = content
             if mtime or ctime:
                 self.meta.setdefault(vault, {})[path] = {
@@ -277,12 +300,14 @@ class VaultMirror:
 
     def apply_delete(self, vault: str, path: str) -> None:
         with self.lock:
+            self._ensure_vault(vault)
             self.notes.setdefault(vault, {}).pop(path, None)
             self.meta.setdefault(vault, {}).pop(path, None)
             self._remove_note(vault, path)
 
     def apply_rename(self, vault: str, old: str, new: str) -> None:
         with self.lock:
+            self._ensure_vault(vault)
             # Validate BOTH paths before touching anything. Mutating first and
             # validating inside _persist_note loses the note entirely when the
             # destination is rejected: the source is already gone from memory,
@@ -307,6 +332,7 @@ class VaultMirror:
 
     def set_watermark(self, vault: str, last_time: int) -> None:
         with self.lock:
+            self._ensure_vault(vault)
             if last_time > self.last_time.get(vault, 0):
                 self.last_time[vault] = last_time
                 self._persist_meta(vault)
@@ -503,7 +529,12 @@ class FNSReadClient(threading.Thread):
                 continue
 
             self._dispatch(action, env, default_vault=vault)
-            if draining_last:
+            if draining_last and action in PAGE_DETAIL_ACTIONS:
+                # Count ONLY the actions a page is made of. Counting every
+                # dispatched frame lets an unrelated live broadcast -- which
+                # arrives on the same socket, for any vault -- inflate the tally
+                # and end the sync early, advancing the watermark past a note
+                # that was never applied.
                 last_page_seen += 1
                 if last_page_seen >= last_page_expected:
                     completed = True

@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import struct
 import sys
 import time
@@ -184,10 +185,15 @@ def note_from_ticket(t: dict) -> str:
     # Everything the frontmatter cannot hold, verbatim and recoverable.
     # `pr` rides along whenever it is not a bare URL string, so the object's
     # other keys survive the flattening above.
-    extra = {f: t[f] for f in BLOCK_FIELDS if f in t}
-    for f in ("summary", "title", "description", "branch", "risk"):
-        if f in t:
-            extra[f] = t[f]
+    # DENYLIST, not an allowlist: everything that is not a flat frontmatter
+    # scalar rides in the data block. An allowlist silently DELETED any field it
+    # did not know about -- a schema extension or hand-added metadata would
+    # vanish on the next board write, from the only live copy.
+    extra = {
+        k: v
+        for k, v in t.items()
+        if k not in SCALAR_FIELDS and k not in LIST_FIELDS
+    }
     pr = t.get("pr")
     if isinstance(pr, dict):
         extra["pr"] = pr
@@ -362,8 +368,12 @@ def _split_prose(prose: str, key: str):
         return None, None
 
     rest = lines[idx:]
-    while rest and (not rest[0].strip() or rest[0].startswith("> ")):
-        rest.pop(0)  # blank line after the heading, and the wikilink block
+    # Strip ONLY the wikilink block this renderer emits ("> type [[KEY]]"), and
+    # the blank line after the heading. Dropping every leading "> " line eats a
+    # description that legitimately opens with a Markdown blockquote.
+    link_re = re.compile(r"^> \S+ \[\[[^\]]+\]\]$")
+    while rest and (not rest[0].strip() or link_re.match(rest[0])):
+        rest.pop(0)
     text = "\n".join(rest)
     if DESC_MARKER in text:
         # Cut at the explicit marker: unambiguous regardless of how the
@@ -557,12 +567,14 @@ def cmd_pull(args) -> int:
 
     written = skipped = 0
     seen = set()
+    failed_paths = []
     for path in sorted(paths):
         try:
             note = (get_note(path).get("data") or {}).get("content")
-        except urllib.error.HTTPError as e:
-            print(f"  {path}: HTTP {e.code}", file=sys.stderr)
+        except Exception as e:  # noqa: BLE001 - a transient error must not crash a cron job
+            print(f"  {path}: {type(e).__name__}: {e}", file=sys.stderr)
             skipped += 1
+            failed_paths.append(path)
             continue
         if not note:
             skipped += 1
@@ -619,20 +631,40 @@ def cmd_pull(args) -> int:
         tmp.replace(target)
         written += 1
 
-    # A ticket archived in the vault should leave the git board too, or the
-    # two drift and the daily diff never comes back clean.
+    # A ticket archived in the vault should leave the git board too, or the two
+    # drift and the daily diff never comes back clean.
+    #
+    # But prune ONLY on positive evidence that the vault no longer has the note.
+    # A ticket is "not seen" both when it was archived and when its note failed
+    # to fetch, was empty, or would not parse -- and deleting on the second
+    # meaning destroys the git archive, which is the rollback copy, on a
+    # transient error. Verified: an HTTP 500, an empty note and an unparseable
+    # note each deleted a live ticket's JSON and still exited 0.
     removed = 0
     if args.prune:
-        for existing in sorted(tickets_dir.glob("*.json")):
-            if existing.stem not in seen:
-                existing.unlink()
-                removed += 1
+        if skipped:
+            print(
+                f"prune SKIPPED: {skipped} note(s) could not be read, so an "
+                f"absent ticket cannot be told from an unreadable one. "
+                f"Re-run when the vault is healthy.",
+                file=sys.stderr,
+            )
+        else:
+            vault_keys = {
+                Path(p).stem for p in paths
+            }  # every ticket note the vault listed
+            for existing in sorted(tickets_dir.glob("*.json")):
+                if existing.stem not in vault_keys:
+                    existing.unlink()
+                    removed += 1
 
     print(
         f"pull: {written} written, {skipped} skipped, {removed} pruned "
         f"({len(seen)} tickets in the vault)"
     )
-    return 0
+    # A skipped ticket means the git archive is now incomplete. Say so in the
+    # exit code, or a cron job reports success while the rollback copy rots.
+    return 1 if skipped else 0
 
 
 def cmd_log(args) -> int:

@@ -19,16 +19,60 @@ sole writer.
 
 from __future__ import annotations
 
+import contextlib
+import os
 import re
+import tempfile
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 LOG_PATH = "_log/transitions.md"
 
 # The single writer's lock. See the module docstring: without this the log
 # silently loses lines under concurrency.
 _APPEND_LOCK = threading.Lock()
+
+# ...but a threading lock only binds ONE process. `vault.py log` is a second
+# writer by design (it repairs a line the server failed to write), and it can
+# run while the server is appending -- two read-modify-writes with no shared
+# lock, which is exactly the race that costs lines. A lock file makes the two
+# processes serialise against each other.
+_LOCK_FILE = Path(
+    os.environ.get("SDLC_LOG_LOCK", Path(tempfile.gettempdir()) / "sdlc-translog.lock")
+)
+
+
+@contextlib.contextmanager
+def _cross_process_lock(timeout=30.0):
+    """flock the lock file, so a second process cannot append concurrently.
+
+    Falls back to the in-process lock alone where flock is unavailable rather
+    than refusing to write: a lost line is bad, a board that cannot log at all
+    is worse.
+    """
+    try:
+        import fcntl
+    except ImportError:
+        yield
+        return
+    _LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.time() + timeout
+    with open(_LOCK_FILE, "a+") as fh:
+        while True:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.time() > deadline:
+                    msg = f"could not acquire {_LOCK_FILE} within {timeout}s"
+                    raise TimeoutError(msg) from None
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
 LINE_RE = re.compile(
     r"^- (?P<ts>\S+) (?P<key>[A-Z][A-Z0-9]*-\d+) "
@@ -83,7 +127,7 @@ def append_transition(read_note, write_note, key, frm, to, actor, when=None) -> 
     and lets the log be created on first use.
     """
     line = format_line(key, frm, to, actor, when)
-    with _APPEND_LOCK:
+    with _APPEND_LOCK, _cross_process_lock():
         existing = read_note(LOG_PATH)
         if existing is None:
             body = (
@@ -99,12 +143,25 @@ def append_transition(read_note, write_note, key, frm, to, actor, when=None) -> 
 
 
 def read_events(log_text: str):
-    """{key: [event, ...]} in file order, which is chronological."""
+    """{key: [event, ...]}, oldest first, ordered by TIMESTAMP not file position.
+
+    File order is not reliably chronological. Two transitions racing through
+    `POST /ticket` are appended in whichever order wins the append lock, which
+    is not necessarily the order the writes happened; and `vault.py log` repairs
+    a missing line by appending it at the end, long after the transition it
+    records. Several readers take `events[-1]` as "the latest", so trusting file
+    order puts a stale status in `_since`, in `/metrics`, and in the date a
+    dated archive uses.
+
+    The sort is stable, so two lines sharing a second keep their file order.
+    """
     events = {}
     for raw in (log_text or "").split("\n"):
         parsed = parse_line(raw)
         if parsed:
             events.setdefault(parsed["key"], []).append(parsed)
+    for evs in events.values():
+        evs.sort(key=lambda e: e["ts"])
     return events
 
 

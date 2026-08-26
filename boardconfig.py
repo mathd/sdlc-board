@@ -73,17 +73,51 @@ def parse(text: str) -> dict:
     except ValueError:
         return cfg
 
-    for line in text[4:end].split("\n"):
+    # Both inline JSON (`statuses: ["A","B"]`) and YAML block style are
+    # accepted. Skipping indented lines instead -- as this parser first did --
+    # makes a block-style list silently fall back to DEFAULTS, so a vault
+    # renders the WRONG workflow with no error at all.
+    lines = text[4:end].split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        i += 1
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         if line[:1] in (" ", "\t", "-"):
-            continue  # nested block styles are not used by this format
+            continue  # a stray child line with no parent; the block reader eats its own
         key, sep, raw = line.partition(":")
         if not sep:
             continue
-        value = _scalar(raw)
-        if value is not None:
-            cfg[key.strip()] = value
+        key = key.strip()
+
+        if raw.strip():
+            value = _scalar(raw)
+            if value is not None:
+                cfg[key] = value
+            continue
+
+        # Empty value: read the indented block that follows.
+        block, seq, mapping = [], [], {}
+        while i < len(lines):
+            nxt = lines[i]
+            if not nxt.strip():
+                i += 1
+                continue
+            if nxt[:1] not in (" ", "\t"):
+                break
+            i += 1
+            item = nxt.strip()
+            if item.startswith("- "):
+                seq.append(_scalar(item[2:]))
+            elif ":" in item:
+                k2, _, v2 = item.partition(":")
+                mapping[k2.strip()] = _scalar(v2)
+            block.append(item)
+        if seq:
+            cfg[key] = seq
+        elif mapping:
+            cfg[key] = mapping
 
     found = cfg.get("schema", SCHEMA)
     if not isinstance(found, int) or isinstance(found, bool) or found < SCHEMA_MIN:

@@ -667,10 +667,15 @@ let modalTab = "thread";
 let VAULT = "";
 try { VAULT = localStorage.getItem("sdlc.vault") || ""; } catch { VAULT = ""; }
 const vq = (sep) => VAULT ? `${sep}vault=${encodeURIComponent(VAULT)}` : "";
+let VAULT_GEN = 0;   // bumped on every switch; a response from an older
+                     // generation is discarded rather than allowed to
+                     // overwrite the new vault's board.
 function switchVault(v){
   VAULT = v;
+  VAULT_GEN++;
   try { localStorage.setItem("sdlc.vault", v); } catch {}
   Object.keys(HIST).forEach(k => delete HIST[k]);   // history is per vault
+  BOARD = {tickets: [], statuses: BOARD.statuses || [], now: 0};
   painted = "";                                      // force a full repaint
   render();
 }
@@ -696,7 +701,9 @@ const HIST = {};  // key -> events from /history (fetched on open, not per repai
 
 async function loadHistory(key){
   try {
+    const gen = VAULT_GEN;
     const r = await (await fetch(`/history?key=${key}${vq("&")}`)).json();
+    if (gen !== VAULT_GEN) return;   // vault switched while this was in flight
     HIST[key] = r.events || [];
   } catch { HIST[key] = []; }
   if (selectedKey === key) renderModal();
@@ -710,6 +717,7 @@ const GATE_ACTIONS = {
 async function gateAction(key){
   const t = BOARD.tickets.find(x => x.key === key);
   if (!t || !t.labels.includes("needs:human")) return;
+  const gateFrom = t.status;   // the status this gate is moving FROM, for the CAS
   if (t.status === "Planning"){
     t.status = "Building";
     t.labels = t.labels.filter(l => l !== "needs:human").concat("agent:coding");
@@ -728,7 +736,8 @@ async function gateAction(key){
     t.comments.push({stage:"po-review", kind:"summary", body:"Gate 4 — PO validated the COS and accepted (via board)."});
   } else return;
   paintMoved();
-  await save(t, `${t.key}: gate cleared → ${t.status}`);
+  await save({...t, _rev: gateFrom, role: "human"},
+             `${t.key}: gate cleared → ${t.status}`);
   delete HIST[key];
   loadHistory(key);
 }
@@ -896,7 +905,9 @@ async function openMetrics(){
   const m = document.getElementById("mmodal");
   m.innerHTML = `<div class="mbody"><p class="empty">Computing from git history…</p></div>`;
   try {
+    const gen = VAULT_GEN;
     const d = await (await fetch(`/metrics${vq("?")}`)).json();
+    if (gen !== VAULT_GEN) return;   // vault switched while this was in flight
     const cols = [...BOARD.statuses.filter(s => s !== "Done"), "BLOCKED"];
     const rows = d.tickets.map(t => `<tr onclick="closeMetrics();openTicket('${t.key}')">
         <td><b>${esc(t.key)}</b></td>
@@ -931,7 +942,9 @@ async function render(){
   if (dragKey) return;                        // don't wipe drag state mid-drag
   if (document.activeElement && document.activeElement.classList.contains("archdate")) return;  // date picker open
   try {
+    const gen = VAULT_GEN;
     const fetched = await (await fetch("/board?t="+Date.now()+vq("&"))).json();
+    if (gen !== VAULT_GEN) return;   // vault switched while this was in flight
     paintVaults(fetched);
     if (fetched.unsupportedSchema){
       const u = fetched.unsupportedSchema;

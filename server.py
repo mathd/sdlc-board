@@ -151,8 +151,16 @@ class VaultWriteError(Exception):
 # summary, description, readiness, comments, context, links -- is authored in
 # Obsidian or by an agent, and a board write must never carry a stale copy of it
 # back over a fresher one.
+# The only fields a board action may change.
 BOARD_WRITABLE_FIELDS = ("status", "labels", "assignee", "pr", "classification",
                          "parent", "type")
+
+# `comments` is NOT in that set, because a drag sends the browser's whole stale
+# array and replacing the vault's with it would drop any comment an agent added
+# meanwhile. But the gate buttons legitimately append one, so comments are
+# APPENDED, never replaced: whatever the client sends beyond what the vault
+# already holds is added to the end, and nothing is ever removed by a board
+# write.
 
 def _log_read(path, vault=None):
     """Read a note for the transition log, or None if it does not exist yet."""
@@ -241,6 +249,13 @@ def write_ticket(key, ticket, moving_from, actor, vault=None):
             for field in BOARD_WRITABLE_FIELDS:
                 if field in ticket:
                     merged[field] = ticket[field]
+
+            # Append-only comments (see BOARD_WRITABLE_FIELDS above).
+            incoming = ticket.get("comments")
+            if isinstance(incoming, list):
+                current = existing.get("comments") or []
+                if len(incoming) > len(current):
+                    merged["comments"] = current + incoming[len(current) :]
             new_content = note_from_ticket(merged)
             if new_content == content:
                 return {"status": new_status, "attempts": attempt, "noop": True}
@@ -399,11 +414,18 @@ class Handler(SimpleHTTPRequestHandler):
                 continue
             key = t["key"]
             if cutoff is not None:
-                ev = events.get(key)
-                if not ev:
-                    skipped.append(key)  # no logged Done date: do not guess
+                # The date must come from the transition that entered Done, not
+                # from whatever happened last. A Done ticket whose Done
+                # transition was never logged has NO known Done date, and using
+                # an unrelated transition's date archives it on a guess.
+                ev = events.get(key) or []
+                done_at = next(
+                    (e["ts"] for e in reversed(ev) if e["to"] == "Done"), None
+                )
+                if done_at is None:
+                    skipped.append(key)
                     continue
-                if ev[-1]["ts"] >= cutoff:
+                if done_at >= cutoff:
                     continue
             src = f"{TICKET_PREFIX}{key}.md"
             try:
