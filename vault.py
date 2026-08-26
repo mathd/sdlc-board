@@ -200,6 +200,100 @@ def note_from_ticket(t: dict) -> str:
     return "\n".join(lines)
 
 
+# The order the source JSON uses. A pull writes ticket files back for the git
+# board, and §8's cutover check is a daily `git diff`: if the key order changes,
+# every file shows as modified and the diff stops meaning "the boards disagree".
+FIELD_ORDER = (
+    "key", "type", "parent", "classification", "status", "labels", "assignee",
+    "pr", "summary", "title", "description", "links", "readiness", "context",
+    "comments", "comment", "branch", "risk",
+)
+
+
+# Nested objects are rendered with sort_keys=True in the note (that keeps note
+# content deterministic, which the content-hash comparison relies on), so their
+# key order must be restored here instead.
+NESTED_ORDER = {
+    "pr": ("number", "url", "state", "mergeCommit", "merge_commit", "branch"),
+    "comment": ("stage", "kind", "author", "body"),
+}
+COMMENT_ORDER = ("stage", "kind", "author", "body")
+LINK_ORDER = ("type", "key")
+READINESS_ORDER = ("state", "owner", "note")
+
+
+def _reorder(value, order):
+    if not isinstance(value, dict):
+        return value
+    out = {k: value[k] for k in order if k in value}
+    out.update({k: v for k, v in value.items() if k not in out})
+    return out
+
+
+def _detect_indent(text: str):
+    """The indent width a JSON file already uses, from its second line."""
+    for line in text.split("\n")[1:]:
+        stripped = line.lstrip(" ")
+        if stripped and stripped != line:
+            return len(line) - len(stripped)
+    return None
+
+
+def reorder_like(value, template):
+    """Recursively restore `template`'s key order onto `value`.
+
+    The note render uses sort_keys=True (it keeps note content deterministic,
+    which the content-hash comparison depends on), so every nested object comes
+    back alphabetised. Rather than hand-maintain an ordering table for each
+    nested shape, take the order from the file we are about to overwrite: the
+    cutover diff should show DRIFT, not formatting.
+    """
+    if isinstance(value, dict) and isinstance(template, dict):
+        out = {}
+        for k in template:
+            if k in value:
+                out[k] = reorder_like(value[k], template[k])
+        for k, v in value.items():
+            if k not in out:
+                out[k] = v
+        return out
+    if isinstance(value, list) and isinstance(template, list):
+        return [
+            reorder_like(v, template[i]) if i < len(template) else v
+            for i, v in enumerate(value)
+        ]
+    return value
+
+
+# Frontmatter always emits these, even when the source JSON omitted them, so a
+# pull would otherwise add `"parent": null` to every ticket that never had one
+# and make the cutover diff noisy with changes that carry no information.
+DROP_IF_NULL = ("parent", "classification", "assignee", "pr")
+
+
+def ordered_ticket(t: dict, keep_nulls=()) -> dict:
+    """Re-key a ticket into the source's field order, extras last."""
+    t = {
+        k: v
+        for k, v in t.items()
+        if not (k in DROP_IF_NULL and v is None and k not in keep_nulls)
+    }
+    out = {k: t[k] for k in FIELD_ORDER if k in t}
+    out.update({k: v for k, v in t.items() if k not in out})
+    for field, order in NESTED_ORDER.items():
+        if field in out:
+            out[field] = _reorder(out[field], order)
+    if isinstance(out.get("comments"), list):
+        out["comments"] = [_reorder(c, COMMENT_ORDER) for c in out["comments"]]
+    if isinstance(out.get("links"), list):
+        out["links"] = [_reorder(x, LINK_ORDER) for x in out["links"]]
+    if isinstance(out.get("readiness"), dict):
+        out["readiness"] = {
+            k: _reorder(v, READINESS_ORDER) for k, v in out["readiness"].items()
+        }
+    return out
+
+
 def ticket_from_note(text: str) -> dict:
     """Inverse of note_from_ticket. Used by selfcheck and the read path."""
     t: dict = {}
@@ -315,6 +409,38 @@ def put_note(path: str, content: str, vault: str | None = None) -> dict:
     )
 
 
+def _list_note_paths(prefix="", page_size=100, vault=None):
+    """Every note path in the vault, paginated.
+
+    THE SERVER CAPS pageSize AT 100 and does not say so: asking for 1000 returns
+    100 rows while `pager.totalRows` reports the real count. A single request
+    therefore truncates silently, which is how a pull quietly wrote back only
+    99 of 272 tickets. Always page until the rows run out.
+    """
+    # The ONLY reliable stop condition is an empty page. `len(rows) < page_size`
+    # is wrong precisely because the server caps pageSize without saying so:
+    # ask for 1000, get 100, and a short-page test ends the loop after one page
+    # having silently seen a third of the vault.
+    out, page = [], 1
+    seen = 0
+    while True:
+        q = f"?vault={vault or VAULT}&page={page}&pageSize={page_size}"
+        data = (_request("GET", "/api/notes", query=q) or {}).get("data") or {}
+        rows = data.get("list") or []
+        if not rows:
+            break
+        seen += len(rows)
+        for r in rows:
+            path = r.get("path", "")
+            if path.startswith(prefix):
+                out.append(path)
+        total = (data.get("pager") or {}).get("totalRows")
+        if total is not None and seen >= total:
+            break
+        page += 1
+    return sorted(set(out))
+
+
 def move_note(old_path: str, new_path: str, vault: str | None = None) -> dict:
     """Move a note within a vault.
 
@@ -407,6 +533,108 @@ def cmd_migrate(args) -> int:
     return 1 if fail else 0
 
 
+def cmd_pull(args) -> int:
+    """Write vault state back into the sdlc-state worktree as ticket JSON.
+
+    This is what makes the cutover rollback real (plan §8): the git board keeps
+    working, read-only, fed by this. Phase 2 stripped git from `server.py`, not
+    from here.
+
+    It is one-way by design -- vault to git, never back. Bidirectional
+    reconciliation is explicitly out of scope, and a git-to-vault path would
+    give the archive a way to overwrite live state.
+    """
+    if not TOKEN:
+        print("FNS_TOKEN is not set", file=sys.stderr)
+        return 2
+
+    tickets_dir = Path(args.into)
+    if not tickets_dir.exists():
+        print(f"no such directory: {tickets_dir}", file=sys.stderr)
+        return 2
+
+    paths = _list_note_paths(prefix="tickets/", page_size=args.page_size)
+
+    written = skipped = 0
+    seen = set()
+    for path in sorted(paths):
+        try:
+            note = (get_note(path).get("data") or {}).get("content")
+        except urllib.error.HTTPError as e:
+            print(f"  {path}: HTTP {e.code}", file=sys.stderr)
+            skipped += 1
+            continue
+        if not note:
+            skipped += 1
+            continue
+        try:
+            ticket = ticket_from_note(note)
+        except (ValueError, KeyError) as e:
+            print(f"  {path}: unparseable ({e})", file=sys.stderr)
+            skipped += 1
+            continue
+        key = ticket.get("key")
+        if not key:
+            skipped += 1
+            continue
+        seen.add(key)
+        target = tickets_dir / f"{key}.json"
+        shaped = ordered_ticket(ticket)
+        if target.exists():
+            try:
+                template = json.loads(target.read_text(encoding="utf-8"))
+            except ValueError:
+                template = None
+            if isinstance(template, dict):
+                # Frontmatter always emits parent/classification/assignee/pr.
+                # Keep a null the existing file HAD and drop one it did not, so
+                # the cutover diff shows drift rather than formatting.
+                keep = tuple(f for f in DROP_IF_NULL if f in template)
+                for field in keep:
+                    shaped.setdefault(field, None)
+                # The existing file's own key order wins: FIELD_ORDER is only a
+                # fallback for a ticket the worktree has never seen. Some source
+                # files order their top-level keys differently, and imposing one
+                # order on them turns the cutover diff into noise.
+                shaped = reorder_like(
+                    ordered_ticket(shaped, keep_nulls=keep), template
+                )
+        # Match the existing file's formatting exactly -- indent width and
+        # trailing newline both vary across the corpus (a handful of tickets use
+        # a 1-space indent, a few end without a newline). The cutover check in
+        # §8 is a daily `git diff`, so any formatting we impose shows up as
+        # drift that is not drift and makes the signal useless.
+        existing = target.read_text(encoding="utf-8") if target.exists() else None
+        indent, newline = 2, True
+        if existing:
+            indent = _detect_indent(existing) or 2
+            newline = existing.endswith("\n")
+        body = json.dumps(shaped, indent=indent, ensure_ascii=False)
+        if newline:
+            body += "\n"
+        if existing == body:
+            continue
+        tmp = target.with_suffix(".json.tmp")
+        tmp.write_text(body, encoding="utf-8")
+        tmp.replace(target)
+        written += 1
+
+    # A ticket archived in the vault should leave the git board too, or the
+    # two drift and the daily diff never comes back clean.
+    removed = 0
+    if args.prune:
+        for existing in sorted(tickets_dir.glob("*.json")):
+            if existing.stem not in seen:
+                existing.unlink()
+                removed += 1
+
+    print(
+        f"pull: {written} written, {skipped} skipped, {removed} pruned "
+        f"({len(seen)} tickets in the vault)"
+    )
+    return 0
+
+
 def cmd_log(args) -> int:
     """Manually append one transition line.
 
@@ -454,6 +682,19 @@ def main() -> int:
     m.add_argument("--limit", type=int, default=0)
     m.add_argument("--dry-run", action="store_true")
     m.set_defaults(func=cmd_migrate)
+
+    default_state = (
+        Path.home() / "sources" / "ticketing_system.sdlc-state" / ".sdlc" / "tickets"
+    )
+    pl = sub.add_parser("pull", help="write vault state back to the sdlc-state worktree")
+    pl.add_argument("--into", default=str(default_state))
+    pl.add_argument("--page-size", type=int, default=1000)
+    pl.add_argument(
+        "--prune",
+        action="store_true",
+        help="delete ticket JSON whose note is no longer in the vault (archived)",
+    )
+    pl.set_defaults(func=cmd_pull)
 
     lg = sub.add_parser("log", help="manually append one transition (repair tool)")
     lg.add_argument("key")

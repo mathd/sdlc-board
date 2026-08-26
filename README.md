@@ -293,6 +293,24 @@ zero after. The mirror persists the server's `mtime`/`ctime` per note alongside 
     - `retentionDays` prunes `GitSyncHistory` rows — the sync job's own status log in the database
       (`git_sync_service.go:651-670`) — and never touches notes. `-1` keeps only the latest record,
       `0` disables cleanup, positive is a day count.
+- **Cutover ready (§8).** `vault.py pull` writes vault state back into the `sdlc-state` worktree as
+  ticket JSON, one-way by design. Runbook: `CUTOVER.md`.
+  - **A pull against an untouched worktree rewrites 271 of 272 tickets byte-for-byte**, so the
+    daily `git diff` is a real drift signal. Getting there meant matching the corpus's own
+    formatting instead of imposing one: indent width varies (a few tickets use a 1-space indent),
+    some files end without a trailing newline, top-level key order differs per ticket, and the note
+    render's `sort_keys=True` alphabetises every nested object. Each of those would otherwise show
+    as a whole-file rewrite — drift that is not drift, which makes the check meaningless.
+  - The one permanent difference is `TKT-219`, the single ticket using `title` instead of
+    `summary`; it gains a derived `summary`. Documented, stable, not drift.
+  - Verified: repeated pulls write nothing (idempotent), a status change made in the vault surfaces
+    as a clean one-line diff (drift IS detected), and `--prune` removes ticket JSON for notes
+    archived in the vault while a pull without it leaves them.
+  - **The listing endpoint caps `pageSize` at 100 and does not say so** — ask for 1000 and get 100
+    while `pager.totalRows` reports the true count. A single unpaginated request therefore
+    truncates silently; the first working pull wrote back only 99 of 272 tickets and reported
+    success. `_list_note_paths` pages until the rows run out, and the only reliable stop condition
+    is an empty page, never a short one.
 - **Not verified:** the two-vault case (§10 "each vault catches up after a reconnect"). Watermarks
   are per vault and reload independently, but the token's allowlist covers only `sdlc`, so the
   convergence test itself has not been run. Do it before relying on Phase 5.
