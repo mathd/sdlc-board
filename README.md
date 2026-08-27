@@ -357,7 +357,43 @@ zero after. The mirror persists the server's `mtime`/`ctime` per note alongside 
   - Also: the three `catch` blocks in `board.html` were unguarded — a stale rejection from the
     previous vault blanked the current vault's history or painted an error over its board.
     Browser-verified, and mutation-checked against the unguarded version.
+- **Fifth review pass (full, fresh scope).** 15 findings; the two Criticals were **silent data
+  loss on ordinary input**, no adversary required:
+  - **A description quoting the ```` ```json sdlc-data ```` fence destroyed the ticket.** The
+    parser took the FIRST fence, so a description documenting this repo's own format was parsed as
+    the data block: the next write truncated the description and dropped `comments`, `readiness`
+    and `links` entirely. Executed. Prose fences are now escaped on render, and the real block is
+    located by scanning from the end for a line-anchored fence whose body parses as JSON — the last
+    fence alone is not enough, because the block's own JSON contains the fence whenever a
+    description quotes it.
+  - **A transient log read failure overwrote the whole transition log.** `_log_read` returned
+    `None` for every error, and `append_transition` read that as "the log does not exist" and wrote
+    a fresh one-line log over the history. Executed: two lines became one. "Unreadable" and
+    "absent" are now distinct (`translog.MISSING`), and an unreadable log refuses the append and
+    reports a gap instead.
+  - **Two gaps in earlier fixes.** `--prune` trusted the note listing, so a `200 OK` carrying
+    `{"code":500,"data":null}` read as "no notes" and **deleted the entire rollback copy, exit 0**
+    (executed). And pull derived its target filename from the note's frontmatter `key`, so a
+    hand-edited note overwrote a *different* ticket's JSON — the key/path check added to
+    `POST /ticket` never covered this path.
+  - **Stored ticket data could execute JavaScript.** `esc()` did not escape quotes and keys were
+    interpolated raw into `onclick` handlers; a hand-edited key executed with same-origin access to
+    the write routes. Fixed at both layers — keys are validated against `KEY_RE` on the read path,
+    and handler interpolation uses a JS-string escaper. Browser-verified with a hostile note in the
+    live vault: the board rendered all 272 real tickets and skipped the hostile one.
+  - Also: the board now honours the `readOnly` flag it was already being sent (offline left
+    dragging, gates and archive enabled against a stale mirror); `/archive` re-reads each note live
+    before moving it; `POST /ticket` validates the status against the vault's configured workflow
+    (a typo persisted into a state no column renders and bypassed every UI gate); the static
+    handler serves only `board.html` (it served `vault.py`, `.git/config`, and would serve a
+    `token.env` dropped beside `server.py` — the exact filename `.gitignore` anticipates);
+    `vault.py migrate` refuses to overwrite a populated vault; CRLF config and notes parse instead
+    of silently vanishing; and transition-log actor fields are sanitised so a newline cannot forge
+    a log line.
+- **Known and NOT fixed:** dragging can cross Gates 2–4 without running the gate action's label
+  and comment changes; `transversal` beyond the first entry and `wip` are read from config but not
+  rendered; `/board` re-parses the whole vault and log on every 1.5s poll, which grows without
+  bound. These are correctness-of-workflow and performance issues, not data loss.
 - **Not verified:** the two-vault case (§10 "each vault catches up after a reconnect"). Watermarks
   are per vault and reload independently, but the token's allowlist covers only `sdlc`, so the
   convergence test itself has not been run. Do it before relying on Phase 5.
-- Phase 3 (REST write path) not started.

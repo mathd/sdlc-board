@@ -66,7 +66,10 @@ def parse(text: str) -> dict:
     """
     cfg = dict(DEFAULTS)
     cfg["wip"] = {}
-    if not text or not text.startswith("---\n"):
+    # A CRLF file starts "---\r\n" and silently fell through to DEFAULTS, so a
+    # line-ending conversion changed the displayed workflow with no warning.
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not text.startswith("---\n"):
         return cfg
     try:
         end = text.index("\n---", 4)

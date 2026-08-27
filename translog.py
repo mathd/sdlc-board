@@ -30,6 +30,15 @@ from pathlib import Path
 
 LOG_PATH = "_log/transitions.md"
 
+# Sentinel: the reader positively determined the log is ABSENT, as opposed to
+# returning None because it could not be read. Conflating the two let one
+# transient failure erase the whole log.
+MISSING = object()
+
+
+class TransitionLogUnavailable(Exception):
+    """The log could not be read, so appending would risk overwriting it."""
+
 # The single writer's lock. See the module docstring: without this the log
 # silently loses lines under concurrency.
 _APPEND_LOCK = threading.Lock()
@@ -80,12 +89,23 @@ LINE_RE = re.compile(
 )
 
 
+_FIELD_BAD = re.compile(r"[\s()]+")
+
+
+def _clean_field(value) -> str:
+    return _FIELD_BAD.sub("_", str(value)).strip("_") or "_"
+
+
 def format_line(key: str, frm: str, to: str, actor: dict, when=None) -> str:
     ts = datetime.fromtimestamp(when or time.time(), timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
+    # Actor values are sanitised: a newline would inject a second, fully valid
+    # transition line, and a space would split one field into two.
     fields = " ".join(
-        f"{k}={v}" for k, v in sorted(actor.items()) if v not in (None, "")
+        f"{k}={_clean_field(v)}"
+        for k, v in sorted(actor.items())
+        if v not in (None, "")
     )
     suffix = f" ({fields})" if fields else ""
     return f"- {ts} {key} {frm} -> {to}{suffix}"
@@ -129,6 +149,20 @@ def append_transition(read_note, write_note, key, frm, to, actor, when=None) -> 
     line = format_line(key, frm, to, actor, when)
     with _APPEND_LOCK, _cross_process_lock():
         existing = read_note(LOG_PATH)
+        if existing is MISSING:
+            existing = None
+        elif existing is None:
+            # "I could not read it" is NOT "it does not exist". Treating a
+            # timeout or a 500 as absence made the next append write a fresh
+            # one-line log OVER the entire history -- verified: two lines of
+            # history became one, while the ticket write still returned success.
+            # Refuse instead; the caller reports the gap and vault.py log can
+            # repair the missing line once the vault is healthy.
+            msg = (
+                "cannot read the transition log; refusing to append rather than "
+                "risk overwriting it"
+            )
+            raise TransitionLogUnavailable(msg)
         if existing is None:
             body = (
                 "# Transition log\n\n"

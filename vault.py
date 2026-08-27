@@ -44,7 +44,24 @@ LIST_FIELDS = ("labels",)
 # Rich structures kept verbatim in a fenced JSON block.
 BLOCK_FIELDS = ("readiness", "links", "comments", "context", "comment")
 
+KEY_RE = re.compile(r"^[A-Z][A-Z0-9]*-\d+$")
+
 DATA_FENCE = "```json sdlc-data"
+# A description may legitimately CONTAIN the fence -- a ticket documenting this
+# very format does, and several in this corpus discuss it. The fence is escaped
+# on the way out and restored on the way in, exactly as the description boundary
+# marker is, so prose can never impersonate the real data block.
+# NOTE the escape must NOT contain DATA_FENCE as a substring, or rindex finds
+# the escaped copy inside the prose and parses that instead.
+DATA_FENCE_ESCAPED = "```json sdlc\u200bdata"
+
+
+def _escape_fence(text: str) -> str:
+    return text.replace(DATA_FENCE, DATA_FENCE_ESCAPED)
+
+
+def _unescape_fence(text: str) -> str:
+    return text.replace(DATA_FENCE_ESCAPED, DATA_FENCE)
 
 # Fixed, unambiguous boundary between the description and whatever follows.
 DESC_MARKER = "<!-- /description -->"
@@ -165,7 +182,7 @@ def note_from_ticket(t: dict) -> str:
     # so such a ticket gains a `summary` equal to its `title`. That is
     # deliberate normalisation, not loss: the board reads `summary`, and the
     # original `title` is preserved verbatim in the data block.
-    title = t.get("summary") or t.get("title") or ""
+    title = _escape_fence(t.get("summary") or t.get("title") or "")
     lines.append(f"# {t.get('key', '')}: {title}".rstrip())
     lines.append("")
 
@@ -176,6 +193,7 @@ def note_from_ticket(t: dict) -> str:
 
     desc = t.get("description")
     if desc:
+        desc = _escape_fence(desc)
         # The description is emitted VERBATIM followed by a fixed two-newline
         # separator. Because the separator is a constant, the parser can remove
         # exactly it and recover a description whether or not it ends in a
@@ -303,6 +321,9 @@ def ordered_ticket(t: dict, keep_nulls=()) -> dict:
 def ticket_from_note(text: str) -> dict:
     """Inverse of note_from_ticket. Used by selfcheck and the read path."""
     t: dict = {}
+    # Normalise line endings first: a CRLF note failed the prefix test and was
+    # dropped as unparseable, making real tickets vanish from the board.
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
     if not text.startswith("---\n"):
         msg = "note has no frontmatter"
         raise ValueError(msg)
@@ -322,12 +343,37 @@ def ticket_from_note(text: str) -> dict:
             t[k] = _parse_yaml_scalar(v)
 
     prose = body
-    if DATA_FENCE in body:
-        start = body.index(DATA_FENCE) + len(DATA_FENCE)
-        blob = body[start:]
-        blob = blob[: blob.index("\n```")]
-        t.update(json.loads(blob))
-        prose = body[: body.index(DATA_FENCE)]
+    # Find the REAL data block: the one this renderer emitted, which always
+    # starts at the beginning of a line and runs to the end of the note.
+    #
+    # Searching for the first fence let a description quoting the fence be
+    # parsed as the block, silently truncating the note and dropping comments,
+    # readiness and links on the next write. Searching for the LAST one is no
+    # better: the block's own JSON contains the fence whenever a description
+    # quotes it. Prose fences are escaped on render, so anchor on a fence that
+    # begins a line and whose body parses as JSON, scanning from the end.
+    cut = None
+    marker = "\n" + DATA_FENCE + "\n"
+    search_from = len(body)
+    while True:
+        idx = body.rfind(marker, 0, search_from)
+        if idx == -1:
+            break
+        blob_start = idx + len(marker)
+        rest = body[blob_start:]
+        end = rest.find("\n```")
+        if end != -1:
+            try:
+                parsed = json.loads(rest[:end])
+            except ValueError:
+                search_from = idx
+                continue
+            t.update(parsed)
+            cut = idx + 1
+            break
+        search_from = idx
+    if cut is not None:
+        prose = body[:cut]
 
     # The RENDERED body wins over the data block for the two fields a human can
     # reasonably retype in Obsidian. Deriving them from the block alone makes
@@ -336,6 +382,7 @@ def ticket_from_note(text: str) -> dict:
     # cannot see because the guarded field never changed.
     summary, description = _split_prose(prose, t.get("key", ""))
     if summary is not None:
+        summary = _unescape_fence(summary)
         t["summary"] = summary
     if description is not None:
         t["description"] = description
@@ -384,7 +431,7 @@ def _split_prose(prose: str, key: str):
     else:
         description = text.strip("\n") or None
     if description:
-        description = _unescape_desc(description)
+        description = _unescape_fence(_unescape_desc(description))
     return summary, (description or None)
 
 
@@ -419,6 +466,10 @@ def put_note(path: str, content: str, vault: str | None = None) -> dict:
     )
 
 
+class VaultListingError(Exception):
+    """The note listing could not be trusted; never prune on a partial list."""
+
+
 def _list_note_paths(prefix="", page_size=100, vault=None):
     """Every note path in the vault, paginated.
 
@@ -433,9 +484,20 @@ def _list_note_paths(prefix="", page_size=100, vault=None):
     # having silently seen a third of the vault.
     out, page = [], 1
     seen = 0
+    total = None
     while True:
         q = f"?vault={vault or VAULT}&page={page}&pageSize={page_size}"
-        data = (_request("GET", "/api/notes", query=q) or {}).get("data") or {}
+        envelope = _request("GET", "/api/notes", query=q) or {}
+        # An error can arrive as HTTP 200 with {"code":500,"data":null}. Reading
+        # that as "no rows, listing complete" made --prune delete the ENTIRE
+        # rollback copy and exit 0 -- executed. Check the envelope.
+        if envelope.get("code") != 1:
+            msg = (
+                f"note listing failed: {envelope.get('code')} "
+                f"{envelope.get('message')}"
+            )
+            raise VaultListingError(msg)
+        data = envelope.get("data") or {}
         rows = data.get("list") or []
         if not rows:
             break
@@ -448,6 +510,9 @@ def _list_note_paths(prefix="", page_size=100, vault=None):
         if total is not None and seen >= total:
             break
         page += 1
+    if total is not None and seen < total:
+        msg = f"note listing incomplete: saw {seen} of {total}"
+        raise VaultListingError(msg)
     return sorted(set(out))
 
 
@@ -515,6 +580,24 @@ def cmd_migrate(args) -> int:
     if not TOKEN:
         print("FNS_TOKEN is not set", file=sys.stderr)
         return 2
+    # migrate is a ONE-TIME import that writes unconditionally. Re-running it
+    # after cutover replaces live notes with stale rollback data and reports
+    # the overwrites as normal progress. Refuse when the vault already holds
+    # tickets unless the caller says explicitly that is what they want.
+    if not args.force and not args.dry_run:
+        try:
+            existing = _list_note_paths(prefix="tickets/")
+        except VaultListingError as e:
+            print(f"cannot check the vault first: {e}", file=sys.stderr)
+            return 1
+        if existing:
+            print(
+                f"refusing to migrate: vault {VAULT!r} already holds "
+                f"{len(existing)} ticket note(s). This command OVERWRITES them "
+                f"from {args.source}. Use --force if that is really what you want.",
+                file=sys.stderr,
+            )
+            return 1
     tickets = load_tickets(Path(args.source))
     if args.limit:
         tickets = tickets[: args.limit]
@@ -563,7 +646,11 @@ def cmd_pull(args) -> int:
         print(f"no such directory: {tickets_dir}", file=sys.stderr)
         return 2
 
-    paths = _list_note_paths(prefix="tickets/", page_size=args.page_size)
+    try:
+        paths = _list_note_paths(prefix="tickets/", page_size=args.page_size)
+    except VaultListingError as e:
+        print(f"pull aborted: {e}", file=sys.stderr)
+        return 1
 
     written = skipped = 0
     seen = set()
@@ -585,10 +672,26 @@ def cmd_pull(args) -> int:
             print(f"  {path}: unparseable ({e})", file=sys.stderr)
             skipped += 1
             continue
+        # The target file comes from the NOTE PATH, never from the parsed
+        # frontmatter. Trusting the key let a hand-edited note overwrite a
+        # DIFFERENT ticket's JSON (executed), and a key like "../victim" or an
+        # absolute path escape the ticket directory entirely.
+        path_key = Path(path).stem
         key = ticket.get("key")
-        if not key:
+        if key != path_key:
+            print(
+                f"  {path}: frontmatter key {key!r} does not match its path; skipping",
+                file=sys.stderr,
+            )
             skipped += 1
+            failed_paths.append(path)
             continue
+        if not KEY_RE.match(path_key):
+            print(f"  {path}: not a valid ticket key; skipping", file=sys.stderr)
+            skipped += 1
+            failed_paths.append(path)
+            continue
+        key = path_key
         seen.add(key)
         target = tickets_dir / f"{key}.json"
         shaped = ordered_ticket(ticket)
@@ -682,10 +785,18 @@ def cmd_log(args) -> int:
         return 2
 
     def read(path):
+        """Same contract as server._log_read: MISSING means absent, None means
+        unreadable -- and appending on unreadable would overwrite the log."""
         try:
-            return (get_note(path).get("data") or {}).get("content")
-        except urllib.error.HTTPError:
+            envelope = get_note(path)
+        except urllib.error.HTTPError as e:
+            return translog.MISSING if e.code in (404, 430) else None
+        except Exception:  # noqa: BLE001
             return None
+        data = envelope.get("data") or {}
+        if data.get("content") is not None:
+            return data["content"]
+        return translog.MISSING if envelope.get("code") == 430 else None
 
     def write(path, content):
         r = put_note(path, content)
@@ -713,6 +824,11 @@ def main() -> int:
     m.add_argument("--source", default=str(default_src))
     m.add_argument("--limit", type=int, default=0)
     m.add_argument("--dry-run", action="store_true")
+    m.add_argument(
+        "--force",
+        action="store_true",
+        help="overwrite live notes even though the vault already has tickets",
+    )
     m.set_defaults(func=cmd_migrate)
 
     default_state = (

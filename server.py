@@ -6,10 +6,11 @@ Ticket state lives in an FNS vault, not in git. A read-only WebSocket client
 board from that mirror.
 
   GET  /board          -> config + tickets, from the in-memory mirror
-  GET  /history?key=K  -> empty until Phase 4 rebuilds it from _log/transitions.md
-  GET  /metrics        -> empty until Phase 4 rebuilds it from _log/transitions.md
+  GET  /history?key=K  -> one ticket's transitions, from _log/transitions.md
+  GET  /metrics        -> stage durations, from _log/transitions.md
+  GET  /vaults         -> the vaults this board can serve
   POST /ticket         -> compare-and-swap one ticket's status into the vault
-  POST /archive        -> 503 until Phase 6 moves it onto POST /api/note/move
+  POST /archive        -> move Done tickets into archive/ (?before=YYYY-MM-DD)
 
 The write is a SERVER-SIDE compare-and-swap, because the vault does not offer
 one. POST /api/note declares a `baseHash` field and ignores it: a write carrying
@@ -34,6 +35,7 @@ import re
 import sys
 import threading
 import time
+import urllib.error
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -58,6 +60,9 @@ MIRROR_DIR = Path(os.environ.get("SDLC_MIRROR", Path.home() / ".cache" / "sdlc-b
 
 # A note is a ticket only if it lives here. _board/ and _log/ are not tickets.
 TICKET_PREFIX = "tickets/"
+
+# The only files the static handler may serve.
+STATIC_ALLOWED = frozenset({"/board.html", "/favicon.ico"})
 
 import vault as _vault
 
@@ -137,8 +142,22 @@ def tickets_from_mirror(vault=None):
         except (ValueError, KeyError) as e:
             print(f"[board] skipping unparseable note {path}: {e}", file=sys.stderr)
             continue
-        if not t.get("key"):
+        # Validate the key on the READ path too. It is interpolated into
+        # inline event handlers in board.html, so a hand-edited key like
+        # `X');fetch('/archive',{method:'POST'});//-1` executes as JavaScript
+        # with same-origin access to the write routes (executed). It also has
+        # to be a string that sort_key can split, or one malformed note takes
+        # the whole board down with an AttributeError.
+        key = t.get("key")
+        if not isinstance(key, str) or not KEY_RE.match(key):
+            print(f"[board] skipping note with invalid key {key!r}: {path}",
+                  file=sys.stderr)
             continue
+        if not isinstance(t.get("status"), str):
+            print(f"[board] skipping {key}: status is not a string", file=sys.stderr)
+            continue
+        if not isinstance(t.get("labels"), list):
+            t["labels"] = []
         out.append(t)
     return sorted(out, key=sort_key)
 
@@ -172,13 +191,27 @@ BOARD_WRITABLE_FIELDS = ("status", "labels", "assignee", "pr", "classification",
 # write.
 
 def _log_read(path, vault=None):
-    """Read a note for the transition log, or None if it does not exist yet."""
+    """Read the transition log.
+
+    Returns its content, `translog.MISSING` when the vault positively says the
+    note does not exist, or None when it could not be read at all. The caller
+    MUST NOT treat the last case as absence -- doing so overwrites the log.
+    """
     try:
         envelope = vault_get_note(path, vault)
-    except Exception:  # noqa: BLE001 - absent note, or vault unreachable
+    except urllib.error.HTTPError as e:
+        # 404/430 is a real "not found"; anything else is a failure to read.
+        return translog.MISSING if e.code in (404, 430) else None
+    except Exception:  # noqa: BLE001 - unreachable vault, timeout, bad payload
         return None
+    code = envelope.get("code")
     data = envelope.get("data")
-    return data.get("content") if data else None
+    if data and data.get("content") is not None:
+        return data["content"]
+    if code in (430,) or (code != 1 and data is None):
+        # The service answered and said there is no such note.
+        return translog.MISSING if code == 430 else None
+    return translog.MISSING
 
 
 def _log_write(path, content, vault=None):
@@ -433,6 +466,17 @@ class Handler(SimpleHTTPRequestHandler):
             )
             return
 
+        # Serve ONLY the board's own assets. SimpleHTTPRequestHandler's document
+        # root is this repository, so the default behaviour served vault.py,
+        # .git/config and directory listings -- and would serve a token.env
+        # dropped beside server.py, which is exactly the filename .gitignore
+        # anticipates (executed). Parent traversal was already handled; the
+        # problem was the root itself.
+        if url.path in ("/", "/board.html"):
+            self.path = "/board.html"
+        elif url.path not in STATIC_ALLOWED:
+            self.send_error(404)
+            return
         try:
             super().do_GET()
         except BrokenPipeError:
@@ -489,6 +533,20 @@ class Handler(SimpleHTTPRequestHandler):
                 if done_at >= cutoff:
                     continue
             src = f"{TICKET_PREFIX}{key}.md"
+            # Re-read the LIVE note before moving it. Archive eligibility came
+            # from the mirror, which is stale whenever the WebSocket is behind
+            # or down -- and moving a ticket that is no longer Done makes an
+            # active ticket vanish from the board.
+            try:
+                fresh = ticket_from_note(
+                    (vault_get_note(src, vault).get("data") or {})["content"]
+                )
+            except Exception as e:  # noqa: BLE001
+                failed.append({"key": key, "error": f"could not re-read: {e}"[:120]})
+                continue
+            if fresh.get("status") != "Done":
+                skipped.append(key)
+                continue
             try:
                 r = vault_move_note(src, f"archive/{key}.md", vault)
             except Exception as e:  # noqa: BLE001
@@ -540,6 +598,31 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if not isinstance(ticket.get("status"), str):
             self.send_error(400, "status must be a string")
+            return
+        # The status must be one the selected vault actually has. Checking only
+        # that it is a string let a typo ("Buidling") persist into a state no
+        # column renders, and let any local REST caller bypass every workflow
+        # and DoR gate in the UI.
+        vault_for_cfg = _selected_vault(urlparse(self.path).query)
+        try:
+            cfg = board_config(vault_for_cfg)
+        except boardconfig.UnsupportedSchema:
+            cfg = boardconfig.DEFAULTS
+        allowed = list(cfg["statuses"]) + list(cfg["transversal"])
+        if ticket["status"] not in allowed:
+            self._json(
+                400,
+                {
+                    "error": "unknown status",
+                    "key": ticket.get("key"),
+                    "status": ticket["status"],
+                    "allowed": allowed,
+                    "message": (
+                        f"{ticket['status']!r} is not a status of vault "
+                        f"{vault_for_cfg!r}"
+                    ),
+                },
+            )
             return
 
         moving_from = ticket.pop("_rev", None)

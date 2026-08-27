@@ -60,6 +60,10 @@
                border-radius:8px; padding:5px 9px; font:inherit; font-size:12px; font-weight:600;
                margin-left:12px; cursor:pointer; }
   .vaultpick:hover { border-color:var(--brand); }
+  .robanner { margin-left:12px; padding:4px 10px; border-radius:8px; font-size:12px;
+              font-weight:600; background:#F68A4B22; color:#F68A4B; border:1px solid #F68A4B55; }
+  body.ro .column { opacity:.85; }
+  body.ro .card { cursor:not-allowed; }
   /* focus mode: Backlog/Done collapse to slim strips (click to expand back) */
   .column.min { flex:0 0 34px; cursor:pointer; align-items:center; justify-content:flex-start;
                 padding-top:12px; }
@@ -294,6 +298,7 @@
   <select id="vaultpick" class="vaultpick" onchange="switchVault(this.value)"
           title="project vault — one WebSocket serves them all, so switching needs no reconnect"></select>
   <span class="meta" id="stamp"><span class="dot"></span>live</span>
+  <span id="robanner" class="robanner" style="display:none"></span>
   <div class="legend">
     <span class="badge b-agent">agent:*</span>
     <span class="badge b-human">needs:human</span>
@@ -325,7 +330,13 @@ let didDrag = false;
 let prevStatus = {};        // key -> status at last render (for the moved pulse)
 let movedKeys = new Set();  // cards to pulse on this render only
 
-const esc = s => (s??"").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+const esc = s => (s??"").replace(/[&<>"']/g, c =>
+  ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+/* For a value interpolated INSIDE an inline handler's JS string literal.
+   esc() alone is not enough there: it now escapes quotes for HTML, but a
+   backslash or newline still breaks out of the JS string. */
+const escJs = s => esc(String(s??"").replace(/[\\'"\n\r]/g, c =>
+  ({"\\":"\\\\","'":"\\'",'"':'\\"',"\n":"\\n","\r":"\\r"}[c])));
 
 /* Minimal, escape-first Markdown → HTML for comment bodies (the agent writes rich plans).
    Scope = what the pipeline actually emits: #..#### headings, **bold**, `code`,
@@ -484,12 +495,12 @@ function card(t, sub){
   const spike = t.type === "Spike" ? " spike" : "";
   /* spike away from its parent's column: keep the attachment visible on the card */
   const par = sub ? null : spikeParent(t);
-  const prepChip = par ? `<span class="spk" onclick="event.stopPropagation();openTicket('${par.key}')"
+  const prepChip = par ? `<span class="spk" onclick="event.stopPropagation();openTicket('${escJs(par.key)}')"
       title="readiness spike — prepares ${esc(par.key)}">⤴ ${esc(par.key)}</span>` : "";
   return `<div class="card ${pipelineClass(t.labels)}${spike}${sub ? " sub" : ""}${moved}" draggable="true"
             style="view-transition-name:${vtName("card-" + t.key)}"
             ondragstart="dragStart(event,'${t.key}')" ondragend="dragEnd(event)"
-            onclick="openTicket('${t.key}')">
+            onclick="openTicket('${escJs(t.key)}')">
     <div class="top">${ticon(t.type)}<span class="key">${esc(t.key)}</span>
       <span class="spacer"></span>${ageChip(t)}${avatar(t.assignee)}</div>
     <div class="summary">${t.type === "Spike" ? "🔍 " : ""}${esc(t.summary)}</div>
@@ -589,6 +600,7 @@ function dragEnd(e){
 }
 function allowDrop(e, el){ e.preventDefault(); el.classList.add("dragover"); }
 function drop(e, status, el){
+  if (BOARD.readOnly){ toast("✋ read-only: the vault is unreachable"); dragKey = null; return; }
   e.preventDefault(); el.classList.remove("dragover");
   const t = BOARD && BOARD.tickets.find(x => x.key === dragKey);
   if (t && t.status !== status){
@@ -642,6 +654,7 @@ function sig(b){
 }
 async function archiveDone(e){
   e.stopPropagation();
+  if (BOARD.readOnly){ toast("✋ read-only: the vault is unreachable"); return; }
   try {
     const q = archBefore ? `?before=${archBefore}` : "";
     const d = await (await fetch("/archive" + q + (q ? vq("&") : vq("?")), { method:"POST" })).json();
@@ -722,6 +735,7 @@ const GATE_ACTIONS = {
   "PO Review": { btn:"✓ Accept → Done",           hint:"Gate 4 — COS validated" }
 };
 async function gateAction(key){
+  if (BOARD.readOnly){ toast("✋ read-only: the vault is unreachable"); return; }
   const t = BOARD.tickets.find(x => x.key === key);
   if (!t || !t.labels.includes("needs:human")) return;
   const gateFrom = t.status;   // the status this gate is moving FROM, for the CAS
@@ -764,7 +778,7 @@ function renderModal(){
   const ga = t.labels.includes("needs:human") && GATE_ACTIONS[t.status];
   const gate = ga ? `<div class="gaterow"><button class="gatebtn" onclick="gateAction('${t.key}')">${ga.btn}</button><span class="hint">${ga.hint}</span></div>` : "";
   const parent = spikeParent(t);
-  const prepares = parent ? `<span class="k">Prepares</span><span class="v"><span class="spk" onclick="openTicket('${parent.key}')">🔍 ${esc(parent.key)}</span> — readiness spike</span>` : "";
+  const prepares = parent ? `<span class="k">Prepares</span><span class="v"><span class="spk" onclick="openTicket('${escJs(parent.key)}')">🔍 ${esc(parent.key)}</span> — readiness spike</span>` : "";
   const dor = t.status === "Done" ? null : dorState(t);   /* Done predates the DoR — no panel */
   const DOR_ICON = { met:"✓", open:"○", deferred:"–" };
   const dorHtml = dor ? `<div class="dorlist">
@@ -845,7 +859,7 @@ function paintYourMove(){
   el.hidden = false;
   const fresh = k => prevYM.size && !prevYM.has(k) ? " new" : "";  // pulse only genuinely new chips
   el.innerHTML = `<span class="ymt">🖐 Your move (${waiting.length + decisions.length})</span>` +
-    waiting.map(t => `<span class="ym${fresh(t.key)}" onclick="openTicket('${t.key}')">
+    waiting.map(t => `<span class="ym${fresh(t.key)}" onclick="openTicket('${escJs(t.key)}')">
       <b>${esc(t.key)}</b> — ${needText(t)}${t._since && BOARD.now ? ` <span class="age">⏱ ${fmtDur(BOARD.now - t._since)}</span>` : ""}</span>`).join("") +
     decisions.map(d => `<span class="ym${fresh(d.t.key + ":" + d.note)}" onclick="openTicket('${d.t.key}')">
       <b>${esc(d.t.key)}</b> — decide: ${esc(d.note || "open shaping question")}</span>`).join("");
@@ -906,7 +920,7 @@ function paint(){
   painted = sig(BOARD);                       // every repaint path lands here, incl. focus toggle + drag
 }
 
-/* --- metrics overlay: exact stage durations from the state-branch git history --- */
+/* --- metrics overlay: stage durations from the vault's transition log --- */
 async function openMetrics(){
   document.getElementById("moverlay").classList.add("show");
   const m = document.getElementById("mmodal");
@@ -916,7 +930,7 @@ async function openMetrics(){
     const d = await (await fetch(`/metrics${vq("?")}`)).json();
     if (gen !== VAULT_GEN) return;   // vault switched while this was in flight
     const cols = [...BOARD.statuses.filter(s => s !== "Done"), "BLOCKED"];
-    const rows = d.tickets.map(t => `<tr onclick="closeMetrics();openTicket('${t.key}')">
+    const rows = d.tickets.map(t => `<tr onclick="closeMetrics();openTicket('${escJs(t.key)}')">
         <td><b>${esc(t.key)}</b></td>
         <td><span class="pill ${STATUS_CLASS[t.status]||'s-todo'}">${esc(t.status)}</span></td>
         ${cols.map(s => `<td>${t.perStatus[s] ? fmtDur(t.perStatus[s]) : "—"}</td>`).join("")}
@@ -929,7 +943,7 @@ async function openMetrics(){
       <div class="mhead"><div class="mtop">
         <span class="mkey">📊 METRICS</span>
         <button class="x" onclick="closeMetrics()" aria-label="Close">×</button>
-      </div><h2>Stage durations — from the state-branch git log</h2></div>
+      </div><h2>Stage durations — from the vault transition log</h2></div>
       <div class="mbody"><div class="mtable-wrap"><table class="mtable">
         <tr><th>Ticket</th><th>Status</th>${cols.map(s=>`<th>${esc(s)}</th>`).join("")}
             <th>Agent</th><th>Human wait</th><th>Total</th></tr>
@@ -954,6 +968,18 @@ async function render(){
     const fetched = await (await fetch("/board?t="+Date.now()+vq("&"))).json();
     if (gen !== VAULT_GEN) return;   // vault switched while this was in flight
     paintVaults(fetched);
+    // The server reports readOnly when the vault is unreachable. Ignoring it
+    // left dragging, gates and archive enabled against a stale mirror, so a
+    // write could act on state that had already changed underneath.
+    document.body.classList.toggle("ro", !!fetched.readOnly);
+    const roBanner = document.getElementById("robanner");
+    if (roBanner){
+      roBanner.style.display = fetched.readOnly ? "" : "none";
+      roBanner.textContent = fetched.readOnly
+        ? `⚠ ${fetched.readOnlyReason || "vault unreachable"}` +
+          (fetched.dataAgeSeconds != null ? ` — data is ${fmtDur(fetched.dataAgeSeconds)} old` : "")
+        : "";
+    }
     if (fetched.unsupportedSchema){
       const u = fetched.unsupportedSchema;
       document.getElementById("board").innerHTML =
