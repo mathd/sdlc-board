@@ -507,7 +507,7 @@ function ageChip(t){
   return `<span class="age ${hot?'hot':''}" title="time in ${esc(t.status)}">⏱ ${fmtDur(s)}</span>`;
 }
 function decisionPhase(c){
-  return c.stage === "backlog" || c.stage === "ready" ? "shaping" :
+  return c.stage === "backlog" ? "shaping" :
     c.stage === "planning" || c.stage === "plan-review" ? "planning" :
     c.stage === "coding" || c.stage === "ai-review" ? "development" : "other";
 }
