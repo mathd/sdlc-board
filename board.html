@@ -197,6 +197,7 @@
   .decision-phase .count { margin-left:auto; font-size:10.5px; }
   .decision { border:1px solid var(--line); border-left:3px solid var(--teal);
               border-radius:8px; padding:12px 13px; margin:0 0 10px; }
+  .decision.superseded { opacity:.48; }
   .decision .marker { font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
                      font-size:11px; font-weight:700; color:var(--teal); margin-bottom:6px; }
 
@@ -836,6 +837,12 @@ function renderModal(){
       </div>`).join("")}
     </div>` : "";
   const decisions = decisionsFor(t);
+  const supersededBy = new Map();
+  decisions.forEach(c => {
+    const replacement = (c.body ?? "").match(/^Decision:\s*(D\d+)\b/m)?.[1];
+    const target = (c.body ?? "").match(/\bSupersedes (D\d+)\b/)?.[1];
+    if (replacement && target) supersededBy.set(target, replacement);
+  });
   let body;
   if (modalTab === "history"){
     const ev = HIST[t.key];
@@ -857,10 +864,14 @@ function renderModal(){
           const entries = decisions.filter(c => decisionPhase(c) === phase);
           if (!entries.length) return "";
           return `<section class="decision-phase"><h3>${label}<span class="count">${entries.length}</span></h3>` +
-            entries.map(c => `<article class="decision">
-              <div class="marker">stage=${esc(c.stage)} · kind=decision</div>
-              <div class="text md">${renderDecision(c.body)}</div>
-            </article>`).join("") + `</section>`;
+            entries.map(c => {
+              const id = (c.body ?? "").match(/^Decision:\s*(D\d+)\b/m)?.[1];
+              const replacement = supersededBy.get(id);
+              return `<article class="decision${replacement ? " superseded" : ""}">
+                <div class="marker">stage=${esc(c.stage)} · kind=decision${replacement ? ` · superseded by ${esc(replacement)}` : ""}</div>
+                <div class="text md">${renderDecision(c.body)}</div>
+              </article>`;
+            }).join("") + `</section>`;
         }).join("")
       : `<p class="empty">No material decisions recorded for this ticket.</p>`;
   } else {
