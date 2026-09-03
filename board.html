@@ -393,9 +393,8 @@ function renderMd(src){
   return out.join("");
 }
 function renderDecision(src){
-  /* Decision comments have a small field vocabulary. Give every field its own paragraph and
-     emphasize its label even when an older entry omitted the template's blank lines. */
-  const fields = /^(Decision ID|Decision|Trigger|Options considered|Why|Consequences|Artifacts|Supersedes):[ \t]*(.*)$/gm;
+  /* Give each canonical decision field its own paragraph and emphasize its label. */
+  const fields = /^(Decision|Why|Consequences|Artifacts):[ \t]*(.*)$/gm;
   return renderMd((src ?? "").replace(fields, (_line, label, value) =>
     `\n**${label}:**${value ? " " + value : ""}`));
 }
