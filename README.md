@@ -127,6 +127,16 @@ python3 server.py 8787          # http://localhost:8787/board.html
 `server.py` binds 127.0.0.1 and is unauthenticated **because** of that. The assumption is
 load-bearing: do not change the bind address without adding authentication.
 
+### Decision logs
+
+The ticket thread stores material choices as append-only comments with `kind: "decision"`. The
+board derives the decision log from those comments. Cards show separate shaping, planning and
+development counts, and the ticket modal groups the full entries in a Decisions tab. This is a
+view over existing ticket data, so it needs no vault schema change or migration.
+
+The SDLC skill defines the entry format and the threshold for a material decision. If a later fact
+changes a choice, append a new entry that names the one it supersedes. Do not rewrite the old entry.
+
 ### The bulk download is PULL-based
 
 The single most surprising part of the protocol. `NoteSync` does not push the notes: the server

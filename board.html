@@ -119,6 +119,10 @@
                    display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden; }
   .card .foot { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
   .card .cmts { font-size:11.5px; color:var(--muted); white-space:nowrap; }
+  .dchip { font-size:10.5px; font-weight:800; color:var(--teal);
+           background:color-mix(in srgb, var(--teal) 13%, transparent);
+           border:1px solid color-mix(in srgb, var(--teal) 45%, transparent);
+           border-radius:20px; padding:2px 8px; white-space:nowrap; }
 
   /* --- type icons (Jira-style) --- */
   .ticon { flex:0 0 15px; width:15px; height:15px; border-radius:3.5px; display:inline-flex;
@@ -184,6 +188,17 @@
                  color:var(--brand); margin-bottom:3px; }
   .cmt .text { font-size:13.5px; line-height:1.55; }
   .empty { color:var(--muted); font-style:italic; }
+  .decision-phase { margin:0 0 22px; }
+  .decision-phase:last-child { margin-bottom:0; }
+  .decision-phase > h3 { display:flex; align-items:center; gap:8px; margin:0 0 12px;
+                         padding-bottom:8px; border-bottom:1px solid var(--line);
+                         color:var(--muted); font-size:12px; text-transform:uppercase;
+                         letter-spacing:.05em; }
+  .decision-phase .count { margin-left:auto; font-size:10.5px; }
+  .decision { border:1px solid var(--line); border-left:3px solid var(--teal);
+              border-radius:8px; padding:12px 13px; margin:0 0 10px; }
+  .decision .marker { font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+                     font-size:11px; font-weight:700; color:var(--teal); margin-bottom:6px; }
 
   /* --- rendered Markdown inside a comment body --- */
   .md { max-width:100%; }
@@ -377,6 +392,13 @@ function renderMd(src){
   flushAll();
   return out.join("");
 }
+function renderDecision(src){
+  /* Decision comments have a small field vocabulary. Give every field its own paragraph and
+     emphasize its label even when an older entry omitted the template's blank lines. */
+  const fields = /^(Decision ID|Decision|Trigger|Options considered|Why|Consequences|Artifacts|Supersedes):[ \t]*(.*)$/gm;
+  return renderMd((src ?? "").replace(fields, (_line, label, value) =>
+    `\n**${label}:**${value ? " " + value : ""}`));
+}
 
 const STATUS_CLASS = {
   "Backlog":"s-todo", "Ready":"s-todo", "Planning":"s-prog", "Building":"s-prog",
@@ -484,6 +506,29 @@ function ageChip(t){
   const hot = t.labels.includes("needs:human") && s > 4*3600;  // waiting on a human > 4h
   return `<span class="age ${hot?'hot':''}" title="time in ${esc(t.status)}">⏱ ${fmtDur(s)}</span>`;
 }
+function decisionPhase(c){
+  return c.stage === "backlog" || c.stage === "ready" ? "shaping" :
+    c.stage === "planning" || c.stage === "plan-review" ? "planning" :
+    c.stage === "coding" || c.stage === "ai-review" ? "development" : "other";
+}
+function decisionsFor(t){
+  return (t.comments || []).filter(c => c && c.kind === "decision");
+}
+function decisionCounts(t){
+  const counts = {shaping:0, planning:0, development:0, other:0, total:0};
+  decisionsFor(t).forEach(c => { counts[decisionPhase(c)]++; counts.total++; });
+  return counts;
+}
+function decisionChip(t){
+  const d = decisionCounts(t);
+  if (!d.total) return "";
+  const parts = [];
+  if (d.shaping) parts.push(`S ${d.shaping}`);
+  if (d.planning) parts.push(`P ${d.planning}`);
+  if (d.development) parts.push(`D ${d.development}`);
+  if (d.other) parts.push(`Other ${d.other}`);
+  return `<span class="dchip" title="Ticket decisions by phase">Decisions ${parts.join(" · ")}</span>`;
+}
 function card(t, sub){
   const n = t.comments ? t.comments.length : 0;
   const pr = t.pr ? `<span class="pr">PR #${t.pr.number} · <span class="${t.pr.state}">${t.pr.state}</span></span>` : "";
@@ -505,7 +550,7 @@ function card(t, sub){
       <span class="spacer"></span>${ageChip(t)}${avatar(t.assignee)}</div>
     <div class="summary">${t.type === "Spike" ? "🔍 " : ""}${esc(t.summary)}</div>
     <div class="foot">
-      <span class="badges">${dorChip}${prepChip}${t.labels.map(badge).join("")}${blkChip}</span>
+      <span class="badges">${dorChip}${prepChip}${decisionChip(t)}${t.labels.map(badge).join("")}${blkChip}</span>
       <span class="spacer"></span>
       ${pr}<span class="cmts">💬 ${n}</span>
     </div>
@@ -791,6 +836,7 @@ function renderModal(){
         ${i.spike ? `<span class="spk" onclick="openTicket('${esc(i.spike)}')">🔍 ${esc(i.spike)}</span>` : ""}
       </div>`).join("")}
     </div>` : "";
+  const decisions = decisionsFor(t);
   let body;
   if (modalTab === "history"){
     const ev = HIST[t.key];
@@ -800,6 +846,24 @@ function renderModal(){
           <span class="hts">${new Date(e.ts*1000).toLocaleString([], {hour12:false})}</span>
           <div><b>${esc(e.subject)}</b><br><span class="empty">${esc(e.status)} · ${e.labels.map(esc).join(", ") || "no labels"}</span></div>
         </div>`).join("");
+  } else if (modalTab === "decisions") {
+    const groups = [
+      ["shaping", "Shaping"],
+      ["planning", "Planning"],
+      ["development", "Development"],
+      ["other", "Other"]
+    ];
+    body = decisions.length
+      ? groups.map(([phase, label]) => {
+          const entries = decisions.filter(c => decisionPhase(c) === phase);
+          if (!entries.length) return "";
+          return `<section class="decision-phase"><h3>${label}<span class="count">${entries.length}</span></h3>` +
+            entries.map(c => `<article class="decision">
+              <div class="marker">stage=${esc(c.stage)} · kind=decision</div>
+              <div class="text md">${renderDecision(c.body)}</div>
+            </article>`).join("") + `</section>`;
+        }).join("")
+      : `<p class="empty">No material decisions recorded for this ticket.</p>`;
   } else {
     body = (t.comments && t.comments.length)
       ? t.comments.map(c => `<div class="cmt"><div class="node"></div><div class="cbody">
@@ -830,6 +894,7 @@ function renderModal(){
       ${dorHtml}
       <div class="tabs">
         <button class="tab ${modalTab==='thread'?'on':''}" onclick="setTab('thread')">Thread (${t.comments ? t.comments.length : 0})</button>
+        <button class="tab ${modalTab==='decisions'?'on':''}" onclick="setTab('decisions')">Decisions (${decisions.length})</button>
         <button class="tab ${modalTab==='history'?'on':''}" onclick="setTab('history')">History${HIST[t.key] ? ` (${HIST[t.key].length})` : ""}</button>
       </div>
       ${body}
